@@ -1,7 +1,7 @@
 # Don't commit binaries
 *.a
 *.asm
-*.dll
+#*.dll
 *.dylib
 *.exe
 *.lib
