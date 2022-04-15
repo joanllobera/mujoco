@@ -72,6 +72,8 @@ public class MjScene : MonoBehaviour {
     }
   }
 
+  public static bool InstanceExists { get => _instance != null; }
+
   private static MjScene _instance = null;
 
   private List<MjComponent> _orderedComponents;
@@ -84,8 +86,14 @@ public class MjScene : MonoBehaviour {
     DestroyScene();
   }
 
+  public EventHandler preUpdateEvent;
+  public EventHandler<MjStepArgs> ctrlCallback;
+  public EventHandler postUpdateEvent;
+
   protected unsafe void FixedUpdate() {
+    preUpdateEvent?.Invoke(this, EventArgs.Empty);
     StepScene();
+    postUpdateEvent?.Invoke(this, EventArgs.Empty);
   }
 
   public bool SceneRecreationAtLateUpdateRequested = false;
@@ -314,7 +322,15 @@ public class MjScene : MonoBehaviour {
     }
     Profiler.BeginSample("MjStep");
     Profiler.BeginSample("MjStep.mj_step");
-    MujocoLib.mj_step(Model, Data);
+    if (ctrlCallback != null){
+      MujocoLib.mj_step1(Model, Data);
+      ctrlCallback?.Invoke(this, new MjStepArgs(Model, Data));
+      MujocoLib.mj_step2(Model, Data);
+    }
+    else {
+      MujocoLib.mj_step(Model, Data);
+    }
+
     Profiler.EndSample(); // MjStep.mj_step
     CheckForPhysicsException();
 
@@ -448,4 +464,15 @@ public class MjScene : MonoBehaviour {
     }
   }
 }
+  public class MjStepArgs : EventArgs
+  {
+    public unsafe MjStepArgs(MujocoLib.mjModel_* model, MujocoLib.mjData_* data){
+      this.model = model; 
+      this.data = data;
+    }
+    public readonly unsafe MujocoLib.mjModel_* model;
+    public readonly unsafe MujocoLib.mjData_* data;
+  }
 }
+
+

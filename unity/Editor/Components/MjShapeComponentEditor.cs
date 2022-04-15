@@ -1,3 +1,4 @@
+#if UNITY_EDITOR
 // Copyright 2019 DeepMind Technologies Limited
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,3 +37,4 @@ public class MjShapeComponentEditor : Editor {
   }
 }
 }
+#endif

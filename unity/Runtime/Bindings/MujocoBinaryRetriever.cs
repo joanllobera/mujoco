@@ -1,3 +1,5 @@
+#if UNITY_EDITOR
+
 // Copyright 2019 DeepMind Technologies Limited
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +18,17 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using UnityEditor;
+
 using UnityEditor.PackageManager;
+
 using UnityEngine;
 
 namespace Mujoco {
 public class MujocoBinaryRetriever {
 
-  [InitializeOnLoadMethod]
-  static void SubscribeToEvent() {
+
+        [InitializeOnLoadMethod]
+        static void SubscribeToEvent() {
     // This causes the method to be invoked after the Editor registers the new list of packages.
     Events.registeredPackages += RegisteredPackagesEventHandler;
   }
@@ -35,7 +40,7 @@ public class MujocoBinaryRetriever {
       if (AssetDatabase.LoadMainAssetAtPath(mujocoPath + "/mujoco.dylib") == null) {
         File.Copy(
             "/Applications/MuJoCo.app/Contents/Frameworks" +
-            "/MuJoCo.framework/Versions/Current/libmujoco.2.1.5.dylib",
+            "/MuJoCo.framework/Versions/Current/libmujoco.2.1.4.dylib",
             mujocoPath + "/mujoco.dylib");
         AssetDatabase.Refresh();
       }
@@ -43,7 +48,7 @@ public class MujocoBinaryRetriever {
       if (AssetDatabase.LoadMainAssetAtPath(mujocoPath + "/libmujoco.so") == null) {
         File.Copy(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) +
-            "/.mujoco/mujoco-2.1.5/lib/libmujoco.so.2.1.5",
+            "/.mujoco/mujoco-2.1.4/lib/libmujoco.so.2.1.4",
             mujocoPath + "/libmujoco.so");
         AssetDatabase.Refresh();
       }
@@ -59,3 +64,4 @@ public class MujocoBinaryRetriever {
   }
 }
 }
+#endif
