@@ -21,13 +21,13 @@ Example:
   mjwarp-viewer benchmark/humanoid/humanoid.xml -o "opt.solver=cg"
 """
 
-import ast
+import copy
 import enum
 import logging
-import pickle
+import shutil
 import sys
 import time
-from typing import Sequence, Union
+from typing import Sequence
 
 import mujoco
 import mujoco.viewer
@@ -37,22 +37,30 @@ from absl import app
 from absl import flags
 from etils import epath
 
-import mujoco_warp as mjw
+import mujoco.mjx.third_party.mujoco_warp as mjw
+
+# mjwarp-viewer has priviledged access to a few internal methods
+from mujoco.mjx.third_party.mujoco_warp._src.io import find_keys
+from mujoco.mjx.third_party.mujoco_warp._src.io import make_trajectory
+from mujoco.mjx.third_party.mujoco_warp._src.io import override_model
 
 
 class EngineOptions(enum.IntEnum):
+  """Engine option."""
+
   WARP = 0
   C = 1
 
 
-_CLEAR_KERNEL_CACHE = flags.DEFINE_bool("clear_kernel_cache", False, "Clear kernel cache (to calculate full JIT time)")
+_CLEAR_WARP_CACHE = flags.DEFINE_bool("clear_warp_cache", False, "Clear warp caches (kernel, LTO, CUDA compute)")
 _ENGINE = flags.DEFINE_enum_class("engine", EngineOptions.WARP, EngineOptions, "Simulation engine")
 _NCONMAX = flags.DEFINE_integer("nconmax", None, "Maximum number of contacts.")
 _NJMAX = flags.DEFINE_integer("njmax", None, "Maximum number of constraints per world.")
+_NCCDMAX = flags.DEFINE_integer("nccdmax", None, "Maximum number of CCD contacts per world.")
 _OVERRIDE = flags.DEFINE_multi_string("override", [], "Model overrides (notation: foo.bar = baz)", short_name="o")
 _KEYFRAME = flags.DEFINE_integer("keyframe", 0, "keyframe to initialize simulation.")
 _DEVICE = flags.DEFINE_string("device", None, "override the default Warp device")
-
+_REPLAY = flags.DEFINE_string("replay", None, "keyframe sequence to replay, keyframe name must prefix match")
 
 _VIEWER_GLOBAL_STATE = {"running": True, "step_once": False}
 
@@ -67,7 +75,7 @@ def key_callback(key: int) -> None:
 
 def _load_model(path: epath.Path) -> mujoco.MjModel:
   if not path.exists():
-    resource_path = epath.resource_path("mujoco_warp") / path
+    resource_path = epath.resource_path("mjx") / "third_party/mujoco_warp" / path
     if not resource_path.exists():
       raise FileNotFoundError(f"file not found: {path}\nalso tried: {resource_path}")
     path = resource_path
@@ -85,47 +93,14 @@ def _load_model(path: epath.Path) -> mujoco.MjModel:
   return spec.compile()
 
 
-def _override(model: Union[mjw.Model, mujoco.MjModel]):
-  enum_fields = {
-    "opt.integrator": mjw.IntegratorType,
-    "opt.cone": mjw.ConeType,
-    "opt.solver": mjw.SolverType,
-    "opt.broadphase": mjw.BroadphaseType,
-    "opt.broadphase_filter": mjw.BroadphaseFilter,
-  }
-  for override in _OVERRIDE.value:
-    if "=" not in override:
-      raise app.UsageError(f"Invalid override format: {override}")
-    key, val = override.split("=", 1)
-    key, val = key.strip(), val.strip()
-
-    if key in enum_fields:
-      try:
-        val = int(enum_fields[key][val.upper()])
-      except KeyError:
-        raise app.UsageError(f"Unrecognized enum value: {val}")
-
-    obj, attrs = model, key.split(".")
-    for i, attr in enumerate(attrs):
-      if not hasattr(obj, attr):
-        raise app.UsageError(f"Unrecognized model field: {key}")
-      if i < len(attrs) - 1:
-        obj = getattr(obj, attr)
-      elif key not in enum_fields:
-        try:
-          val = type(getattr(obj, attr))(ast.literal_eval(val))
-        except (SyntaxError, ValueError):
-          raise app.UsageError(f"Unrecognized value for field: {key}")
-      setattr(obj, attr, val)
-
-
 def _compile_step(m, d):
-  mjw.step(m, d)
-  # double warmup to work around issues with compilation during graph capture:
-  mjw.step(m, d)
+  print("Compiling physics step...", end="", flush=True)
+  start = time.time()
   # capture the whole step function as a CUDA graph
   with wp.ScopedCapture() as capture:
     mjw.step(m, d)
+  elapsed = time.time() - start
+  print(f"done ({elapsed:0.2g}s).")
   return capture.graph
 
 
@@ -138,12 +113,19 @@ def _main(argv: Sequence[str]) -> None:
 
   mjm = _load_model(epath.Path(argv[1]))
   mjd = mujoco.MjData(mjm)
-  if mjm.nkey > 0 and _KEYFRAME.value > -1:
+  ctrls = None
+  ctrlid = 0
+  if _REPLAY.value:
+    keys = find_keys(mjm, _REPLAY.value)
+    if not keys:
+      raise app.UsageError(f"Key prefix not find: {_REPLAY.value}")
+    ctrls = make_trajectory(mjm, keys)
+    mujoco.mj_resetDataKeyframe(mjm, mjd, keys[0])
+  elif mjm.nkey > 0 and _KEYFRAME.value > -1:
     mujoco.mj_resetDataKeyframe(mjm, mjd, _KEYFRAME.value)
-  mujoco.mj_forward(mjm, mjd)
 
   if _ENGINE.value == EngineOptions.C:
-    _override(mjm)
+    override_model(mjm, _OVERRIDE.value)
     print(
       f"  nbody: {mjm.nbody} nv: {mjm.nv} ngeom: {mjm.ngeom} nu: {mjm.nu}\n"
       f"  solver: {mujoco.mjtSolver(mjm.opt.solver).name} cone: {mujoco.mjtCone(mjm.opt.cone).name}"
@@ -154,35 +136,47 @@ def _main(argv: Sequence[str]) -> None:
   else:
     wp.config.quiet = flags.FLAGS["verbosity"].value < 1
     wp.init()
-    if _CLEAR_KERNEL_CACHE.value:
+    wp.set_device(_DEVICE.value)
+    if _CLEAR_WARP_CACHE.value:
       wp.clear_kernel_cache()
+      wp.clear_lto_cache()
+      # Clear CUDA compute cache for truly cold start JIT
+      compute_cache = epath.Path("~/.nv/ComputeCache").expanduser()
+      if compute_cache.exists():
+        shutil.rmtree(compute_cache)
+        compute_cache.mkdir()
 
-    with wp.ScopedDevice(_DEVICE.value):
-      m = mjw.put_model(mjm)
-      _override(m)
-      mjm_hash = pickle.dumps(mjm)
-      broadphase, filter = mjw.BroadphaseType(m.opt.broadphase).name, mjw.BroadphaseFilter(m.opt.broadphase_filter).name
-      solver, cone = mjw.SolverType(m.opt.solver).name, mjw.ConeType(m.opt.cone).name
-      integrator = mjw.IntegratorType(m.opt.integrator).name
-      iterations, ls_iterations, ls_parallel = m.opt.iterations, m.opt.ls_iterations, m.opt.ls_parallel
-      print(
-        f"  nbody: {m.nbody} nv: {m.nv} ngeom: {m.ngeom} nu: {m.nu} is_sparse: {m.opt.is_sparse}\n"
-        f"  broadphase: {broadphase} broadphase_filter: {filter}\n"
-        f"  solver: {solver} cone: {cone} iterations: {iterations} ls_iterations: {ls_iterations} ls_parallel: {ls_parallel}\n"
-        f"  integrator: {integrator} graph_conditional: {m.opt.graph_conditional}"
-      )
-      d = mjw.put_data(mjm, mjd, nconmax=_NCONMAX.value, njmax=_NJMAX.value)
-      print(f"Data\n  nworld: {d.nworld} nconmax: {d.nconmax} njmax: {d.njmax}\n")
-      print("Compiling physics step...", end="")
-      start = time.time()
-      graph = _compile_step(m, d)
-      elapsed = time.time() - start
-      print(f"done ({elapsed:0.2}s).")
-      print(f"MuJoCo Warp simulating with dt = {m.opt.timestep.numpy()[0]:.3f}...")
+    override_model(mjm, _OVERRIDE.value)
+    m = mjw.put_model(mjm)
+    override_model(m, _OVERRIDE.value)
+    d = mjw.put_data(mjm, mjd, nconmax=_NCONMAX.value, njmax=_NJMAX.value, nccdmax=_NCCDMAX.value)
+    graph = _compile_step(m, d) if wp.get_device().is_cuda else None
+    if graph is None:
+      mjw.step(m, d)  # warmup step
+      print("Running Warp unoptimized on CPU.")
+    broadphase, filter = mjw.BroadphaseType(m.opt.broadphase).name, mjw.BroadphaseFilter(m.opt.broadphase_filter).name
+    solver, cone = mjw.SolverType(m.opt.solver).name, mjw.ConeType(m.opt.cone).name
+    integrator = mjw.IntegratorType(m.opt.integrator).name
+    iterations, ls_iterations = m.opt.iterations, m.opt.ls_iterations
+    ls_str = f"{'parallel' if m.opt.ls_parallel else 'iterative'} linesearch iterations: {ls_iterations}"
+    print(
+      f"  nbody: {m.nbody} nv: {m.nv} ngeom: {m.ngeom} nu: {m.nu} is_sparse: {m.is_sparse}\n"
+      f"  broadphase: {broadphase} broadphase_filter: {filter}\n"
+      f"  solver: {solver} cone: {cone} iterations: {iterations} {ls_str}\n"
+      f"  integrator: {integrator} graph_conditional: {m.opt.graph_conditional}"
+    )
+    print(f"Data\n  nworld: {d.nworld} nconmax: {int(d.naconmax / d.nworld)} njmax: {d.njmax}\n")
+    print(f"MuJoCo Warp simulating with dt = {m.opt.timestep.numpy()[0]:.3f}...")
 
   with mujoco.viewer.launch_passive(mjm, mjd, key_callback=key_callback) as viewer:
+    opt = copy.copy(mjm.opt)
+
     while True:
       start = time.time()
+
+      if ctrls is not None and ctrlid < len(ctrls):
+        mjd.ctrl[:] = ctrls[ctrlid]
+        ctrlid += 1
 
       if _ENGINE.value == EngineOptions.C:
         mujoco.mj_step(mjm, mjd)
@@ -193,21 +187,19 @@ def _main(argv: Sequence[str]) -> None:
         wp.copy(d.qpos, wp.array([mjd.qpos.astype(np.float32)]))
         wp.copy(d.qvel, wp.array([mjd.qvel.astype(np.float32)]))
         wp.copy(d.time, wp.array([mjd.time], dtype=wp.float32))
-
-        hash = pickle.dumps(mjm)
-        if hash != mjm_hash:
-          mjm_hash = hash
+        # if the user changed an option in the MuJoCo Simulate UI, go ahead and recompile the step
+        # TODO: update memory tied to option max iterations
+        if mjm.opt != opt:
+          opt = copy.copy(mjm.opt)
           m = mjw.put_model(mjm)
-          graph = _compile_step(m, d)
-
-        if _VIEWER_GLOBAL_STATE["running"]:
-          wp.capture_launch(graph)
-          wp.synchronize()
-        elif _VIEWER_GLOBAL_STATE["step_once"]:
+          graph = _compile_step(m, d) if wp.get_device().is_cuda else None
+        if _VIEWER_GLOBAL_STATE["running"] or _VIEWER_GLOBAL_STATE["step_once"]:
           _VIEWER_GLOBAL_STATE["step_once"] = False
-          wp.capture_launch(graph)
-          wp.synchronize()
-
+          if graph is None:
+            mjw.step(m, d)
+          else:
+            wp.capture_launch(graph)
+            wp.synchronize()
         mjw.get_data_into(mjd, mjm, d)
 
       viewer.sync()

@@ -16,6 +16,7 @@
 
 #include <Python.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <ios>
 #include <iostream>
@@ -55,9 +56,13 @@ namespace {
 // (dim0, dim1).
 #define X_ARRAY_SHAPE(dim0, dim1) XArrayShapeImpl(#dim1)((dim0), (dim1))
 
-std::vector<int> XArrayShapeImpl1D(int dim0, int dim1) { return {dim0}; }
+std::vector<mjtSize> XArrayShapeImpl1D(mjtSize dim0, mjtSize dim1) {
+  return {dim0};
+}
 
-std::vector<int> XArrayShapeImpl2D(int dim0, int dim1) { return {dim0, dim1}; }
+std::vector<mjtSize> XArrayShapeImpl2D(mjtSize dim0, mjtSize dim1) {
+  return {dim0, dim1};
+}
 
 constexpr auto XArrayShapeImpl(const std::string_view dim1_str) {
   if (dim1_str == "1") {
@@ -95,6 +100,19 @@ PYBIND11_MODULE(_structs, m) {
   });
   mjOption.def("__deepcopy__", [](const MjOptionWrapper& other, py::dict) {
     return MjOptionWrapper(other);
+  });
+  mjOption.def_property_readonly_static("_all_fields", [](py::object) {
+    std::vector<std::string> fields;
+#define X(dtype, name) fields.push_back(#name);
+    MJOPTION_FLOATS
+#undef X
+#define X(name, dim0) fields.push_back(#name);
+    MJOPTION_VECTORS
+#undef X
+#define X(dtype, name) fields.push_back(#name);
+    MJOPTION_INTS
+#undef X
+    return py::tuple(py::cast(fields));
   });
   DefineStructFunctions(mjOption);
 
@@ -387,20 +405,20 @@ This is useful for example when the MJB is not available as a file on disk.)"));
 #define X(var)                   \
   mjModel.def_property_readonly( \
       #var, [](const MjModelWrapper& m) { return m.get()->var; });
-  MJMODEL_INTS
+  MJMODEL_SIZES
 #undef X
 
   mjModel.def_property_readonly("_sizes", [](const MjModelWrapper& m) {
     int nint = 0;
 #define X(var) ++nint;
-    MJMODEL_INTS
+    MJMODEL_SIZES
 #undef X
     py::array_t<std::int64_t> sizes(nint);
     {
       int i = 0;
       auto data = sizes.mutable_unchecked();
 #define X(var) data[i++] = m.get()->var;
-      MJMODEL_INTS
+      MJMODEL_SIZES
 #undef X
     }
     py::detail::array_proxy(sizes.ptr())->flags &=
@@ -411,7 +429,18 @@ This is useful for example when the MJB is not available as a file on disk.)"));
   mjModel.def_property_readonly_static("_size_fields", [](py::object) {
     std::vector<std::string> fields;
 #define X(var) fields.push_back(#var);
-    MJMODEL_INTS
+    MJMODEL_SIZES
+#undef X
+    return py::tuple(py::cast(fields));
+  });
+
+  mjModel.def_property_readonly_static("_all_fields", [](py::object) {
+    std::vector<std::string> fields;
+#define X(var) fields.push_back(#var);
+    MJMODEL_SIZES
+#undef X
+#define X(type, name, nr, nc) fields.push_back(#name);
+    MJMODEL_POINTERS
 #undef X
     return py::tuple(py::cast(fields));
   });
@@ -746,6 +775,17 @@ This is useful for example when the MJB is not available as a file on disk.)"));
     py::object new_model_py =
         py::cast(other.model()).attr("__deepcopy__")(memo);
     return MjDataWrapper(other, new_model_py.cast<MjModelWrapper*>());
+  });
+  mjData.def_property_readonly_static("_all_fields", [](py::object) {
+    std::vector<std::string> fields;
+#define X(dtype, name) fields.push_back(#name);
+    MJDATA_SCALAR
+#undef X
+#define X(dtype, name, dim0, dim1) fields.push_back(#name);
+    MJDATA_VECTOR
+    MJDATA_POINTERS
+#undef X
+    return py::tuple(py::cast(fields));
   });
   mjData.def(py::pickle(
       [](const MjDataWrapper& d) {  // __getstate__
@@ -1160,6 +1200,7 @@ This is useful for example when the MJB is not available as a file on disk.)"));
   X(scale);
   X(stereo);
   X(framewidth);
+  X(status);
 #undef X
 
 #define X(var) DefinePyArray(mjvScene, #var, &MjvSceneWrapper::var)

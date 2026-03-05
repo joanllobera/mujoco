@@ -36,10 +36,10 @@
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolvedPath.h>
 #include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/sdf/changeBlock.h>
 #include <pxr/usd/sdf/declareHandles.h>
 #include <pxr/usd/sdf/fileFormat.h>
 #include <pxr/usd/sdf/layer.h>
-#include <pxr/usd/usd/usdaFileFormat.h>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -237,13 +237,15 @@ bool UsdMjcfFileFormat::ReadImpl(pxr::SdfLayer *layer, mjSpec *spec) const {
   auto args = layer->GetFileFormatArguments();
   auto data = InitData(args);
 
-  auto success = mujoco::usd::WriteSpecToData(spec, data);
+  pxr::SdfChangeBlock block;
+  pxr::SdfLayerRefPtr spec_layer = pxr::SdfLayer::CreateAnonymous();
+  auto success = mujoco::usd::WriteSpecToData(spec, spec_layer);
   mj_deleteSpec(spec);
   if (!success) {
     return false;
   }
 
-  _SetLayerData(layer, data);
+  layer->TransferContent(spec_layer);
 
   return true;
 }
@@ -285,7 +287,7 @@ bool UsdMjcfFileFormat::Read(pxr::SdfLayer *layer,
 
 bool UsdMjcfFileFormat::WriteToString(const SdfLayer &layer, std::string *str,
                                       const std::string &comment) const {
-  return SdfFileFormat::FindById(pxr::UsdUsdaFileFormatTokens->Id)
+  return SdfFileFormat::FindById(pxr::TfToken("usda"))
       ->WriteToString(layer, str, comment);
 }
 

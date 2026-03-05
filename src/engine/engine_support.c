@@ -14,6 +14,7 @@
 
 #include "engine/engine_support.h"
 
+#include <inttypes.h>  // IWYU pragma: keep
 #include <stddef.h>
 
 #include <mujoco/mjdata.h>
@@ -25,6 +26,7 @@
 #include "engine/engine_collision_primitive.h"
 #include "engine/engine_core_util.h"
 #include "engine/engine_crossplatform.h"
+#include "engine/engine_memory.h"
 #include "engine/engine_memory.h"
 #include "engine/engine_util_blas.h"
 #include "engine/engine_util_errmem.h"
@@ -41,8 +43,8 @@
 
 //-------------------------- Constants -------------------------------------------------------------
 
- #define mjVERSION 336
-#define mjVERSIONSTRING "3.3.6"
+ #define mjVERSION 3005000
+#define mjVERSIONSTRING "3.5.0"
 
 // names of disable flags
 const char* mjDISABLESTRING[mjNDISABLE] = {
@@ -74,7 +76,8 @@ const char* mjENABLESTRING[mjNENABLE] = {
   "Energy",
   "Fwdinv",
   "InvDiscrete",
-  "MultiCCD"
+  "MultiCCD",
+  "Sleep"
 };
 
 
@@ -110,6 +113,16 @@ const int mjCONDATA_SIZE[mjNCONDATA] = {
 };
 
 
+// size of ray data fields
+const int mjRAYDATA_SIZE[mjNRAYDATA] = {
+  1,  // mjRAYDATA_DIST
+  3,  // mjRAYDATA_DIR
+  3,  // mjRAYDATA_ORIGIN
+  3,  // mjRAYDATA_POINT
+  3,  // mjRAYDATA_NORMAL
+  1   // mjRAYDATA_DEPTH
+};
+
 //-------------------------- get/set state ---------------------------------------------------------
 
 // return size of a single state element
@@ -119,6 +132,7 @@ static inline int mj_stateElemSize(const mjModel* m, mjtState sig) {
   case mjSTATE_QPOS:          return m->nq;
   case mjSTATE_QVEL:          return m->nv;
   case mjSTATE_ACT:           return m->na;
+  case mjSTATE_HISTORY:       return m->nhistory;
   case mjSTATE_WARMSTART:     return m->nv;
   case mjSTATE_CTRL:          return m->nu;
   case mjSTATE_QFRC_APPLIED:  return m->nv;
@@ -135,7 +149,6 @@ static inline int mj_stateElemSize(const mjModel* m, mjtState sig) {
 }
 
 
-
 // return pointer to a single state element
 static inline mjtNum* mj_stateElemPtr(const mjModel* m, mjData* d, mjtState sig) {
   switch (sig) {
@@ -143,6 +156,7 @@ static inline mjtNum* mj_stateElemPtr(const mjModel* m, mjData* d, mjtState sig)
   case mjSTATE_QPOS:          return d->qpos;
   case mjSTATE_QVEL:          return d->qvel;
   case mjSTATE_ACT:           return d->act;
+  case mjSTATE_HISTORY:       return d->history;
   case mjSTATE_WARMSTART:     return d->qacc_warmstart;
   case mjSTATE_CTRL:          return d->ctrl;
   case mjSTATE_QFRC_APPLIED:  return d->qfrc_applied;
@@ -158,17 +172,21 @@ static inline mjtNum* mj_stateElemPtr(const mjModel* m, mjData* d, mjtState sig)
 }
 
 
-
 static inline const mjtNum* mj_stateElemConstPtr(const mjModel* m, const mjData* d, mjtState sig) {
   return mj_stateElemPtr(m, (mjData*) d, sig);  // discard const qualifier from d
 }
 
 
-
 // get size of state signature
-int mj_stateSize(const mjModel* m, unsigned int sig) {
+int mj_stateSize(const mjModel* m, int sig) {
+  if (sig < 0) {
+    mjERROR("invalid state signature %d < 0", sig);
+    return 0;
+  }
+
   if (sig >= (1<<mjNSTATE)) {
-    mjERROR("invalid state signature %u >= 2^mjNSTATE", sig);
+    mjERROR("invalid state signature %d >= 2^mjNSTATE", sig);
+    return 0;
   }
 
   int size = 0;
@@ -183,11 +201,16 @@ int mj_stateSize(const mjModel* m, unsigned int sig) {
 }
 
 
-
 // get state
-void mj_getState(const mjModel* m, const mjData* d, mjtNum* state, unsigned int sig) {
+void mj_getState(const mjModel* m, const mjData* d, mjtNum* state, int sig) {
+  if (sig < 0) {
+    mjERROR("invalid state signature %d < 0", sig);
+    return;
+  }
+
   if (sig >= (1<<mjNSTATE)) {
-    mjERROR("invalid state signature %u >= 2^mjNSTATE", sig);
+    mjERROR("invalid state signature %d >= 2^mjNSTATE", sig);
+    return;
   }
 
   int adr = 0;
@@ -215,11 +238,47 @@ void mj_getState(const mjModel* m, const mjData* d, mjtNum* state, unsigned int 
 }
 
 
+// extract a sub-state from a state
+void mj_extractState(const mjModel* m, const mjtNum* src, int srcsig, mjtNum* dst, int dstsig) {
+  if (srcsig < 0) {
+    mjERROR("invalid srcsig %d < 0", srcsig);
+    return;
+  }
+
+  if (srcsig >= (1<<mjNSTATE)) {
+    mjERROR("invalid srcsig %d >= 2^mjNSTATE", srcsig);
+    return;
+  }
+
+  if ((srcsig & dstsig) != dstsig) {
+    mjERROR("dstsig is not a subset of srcsig");
+    return;
+  }
+
+  for (int i=0; i < mjNSTATE; i++) {
+    mjtState element = 1<<i;
+    if (element & srcsig) {
+      int size = mj_stateElemSize(m, element);
+      if (element & dstsig) {
+        mju_copy(dst, src, size);
+        dst += size;
+      }
+      src += size;
+    }
+  }
+}
+
 
 // set state
-void mj_setState(const mjModel* m, mjData* d, const mjtNum* state, unsigned int sig) {
+void mj_setState(const mjModel* m, mjData* d, const mjtNum* state, int sig) {
+  if (sig < 0) {
+    mjERROR("invalid state signature %d < 0", sig);
+    return;
+  }
+
   if (sig >= (1<<mjNSTATE)) {
-    mjERROR("invalid state signature %u >= 2^mjNSTATE", sig);
+    mjERROR("invalid state signature %d >= 2^mjNSTATE", sig);
+    return;
   }
 
   int adr = 0;
@@ -247,12 +306,47 @@ void mj_setState(const mjModel* m, mjData* d, const mjtNum* state, unsigned int 
 }
 
 
+// copy state from src to dst
+void mj_copyState(const mjModel* m, const mjData* src, mjData* dst, int sig) {
+  if (sig < 0) {
+    mjERROR("invalid state signature %d < 0", sig);
+    return;
+  }
+
+  if (sig >= (1<<mjNSTATE)) {
+    mjERROR("invalid state signature %d >= 2^mjNSTATE", sig);
+    return;
+  }
+
+  for (int i=0; i < mjNSTATE; i++) {
+    mjtState element = 1<<i;
+    if (element & sig) {
+      int size = mj_stateElemSize(m, element);
+
+      // special handling of eq_active (mjtByte)
+      if (element == mjSTATE_EQ_ACTIVE) {
+        int neq = m->neq;
+        for (int j=0; j < neq; j++) {
+          dst->eq_active[j] = src->eq_active[j];
+        }
+      }
+
+      // regular state components (mjtNum)
+      else {
+        mjtNum* dst_ptr = mj_stateElemPtr(m, dst, element);
+        const mjtNum* src_ptr = mj_stateElemConstPtr(m, src, element);
+        mju_copy(dst_ptr, src_ptr, size);
+      }
+    }
+  }
+}
+
 
 // copy current state to the k-th model keyframe
 void mj_setKeyframe(mjModel* m, const mjData* d, int k) {
   // check keyframe index
   if (k >= m->nkey) {
-    mjERROR("index must be smaller than %d (keyframes allocated in model)", m->nkey);
+    mjERROR("index must be smaller than %" PRId64 " (keyframes allocated in model)", m->nkey);
   }
   if (k < 0) {
     mjERROR("keyframe index cannot be negative");
@@ -267,7 +361,6 @@ void mj_setKeyframe(mjModel* m, const mjData* d, int k) {
   mju_copy(m->key_mquat + k*4*m->nmocap, d->mocap_quat, 4*m->nmocap);
   mju_copy(m->key_ctrl + k*m->nu, d->ctrl, m->nu);
 }
-
 
 
 //-------------------------- inertia functions -----------------------------------------------------
@@ -289,12 +382,10 @@ void mj_fullM(const mjModel* m, mjtNum* dst, const mjtNum* M) {
 }
 
 
-
 // multiply vector by inertia matrix
 void mj_mulM(const mjModel* m, const mjData* d, mjtNum* res, const mjtNum* vec) {
   mju_mulSymVecSparse(res, d->M, vec, m->nv, m->M_rownnz, m->M_rowadr, m->M_colind);
 }
-
 
 
 // multiply vector by M^(1/2)
@@ -324,7 +415,6 @@ void mj_mulM2(const mjModel* m, const mjData* d, mjtNum* res, const mjtNum* vec)
 }
 
 
-
 // add inertia matrix to destination matrix
 //  destination can be sparse or dense when all int* are NULL
 void mj_addM(const mjModel* m, mjData* d, mjtNum* dst,
@@ -348,7 +438,6 @@ void mj_addM(const mjModel* m, mjData* d, mjtNum* dst,
     mju_addToSymSparse(dst, d->M, nv, m->M_rownnz, m->M_rowadr, m->M_colind, /*flg_upper*/ 0);
   }
 }
-
 
 
 //-------------------------- perturbations ---------------------------------------------------------
@@ -412,16 +501,23 @@ void mj_applyFT(const mjModel* m, mjData* d,
 }
 
 
-
 // accumulate xfrc_applied in qfrc
 void mj_xfrcAccumulate(const mjModel* m, mjData* d, mjtNum* qfrc) {
-  for (int i=1; i < m->nbody; i++) {
-    if (!mju_isZero(d->xfrc_applied+6*i, 6)) {
-      mj_applyFT(m, d, d->xfrc_applied+6*i, d->xfrc_applied+6*i+3, d->xipos+3*i, i, qfrc);
+  int nbody = m->nbody;
+  const mjtNum *xfrc = d->xfrc_applied;
+
+  // quick return if identically zero (efficient memcmp implementation)
+  if (mju_isZeroByte((const unsigned char*)(xfrc+6), 6*(nbody-1)*sizeof(mjtNum))) {
+    return;
+  }
+
+  // some non-zero wrenches, apply them
+  for (int i=1; i < nbody; i++) {
+    if (!mju_isZero(xfrc+6*i, 6)) {
+      mj_applyFT(m, d, xfrc+6*i, xfrc+6*i+3, d->xipos+3*i, i, qfrc);
     }
   }
 }
-
 
 
 
@@ -456,7 +552,6 @@ static mjtNum mj_geomDistanceCCD(const mjModel* m, const mjData* d, int g1, int 
 }
 
 
-
 // returns the smallest distance between two geoms
 mjtNum mj_geomDistance(const mjModel* m, const mjData* d, int geom1, int geom2, mjtNum distmax,
                        mjtNum fromto[6]) {
@@ -478,13 +573,14 @@ mjtNum mj_geomDistance(const mjModel* m, const mjData* d, int geom1, int geom2, 
     return dist;
   }
 
-  // use nativecdd if flag is enabled
+  // use nativeccd if flag is enabled
   if (!mjDISABLED(mjDSBL_NATIVECCD)) {
     if (func == mjc_Convex || func == mjc_BoxBox) {
-      return mj_geomDistanceCCD(m, d, g1, g2, distmax, fromto);
+      return mj_geomDistanceCCD(m, d, geom1, geom2, distmax, fromto);
     }
   }
 
+  // call collision function with distmax as margin
   int num = func(m, d, con, g1, g2, distmax);
 
   // find smallest distance
@@ -508,7 +604,6 @@ mjtNum mj_geomDistance(const mjModel* m, const mjData* d, int geom1, int geom2, 
 }
 
 
-
 // compute velocity by finite-differencing two positions
 void mj_differentiatePos(const mjModel* m, mjtNum* qvel, mjtNum dt,
                          const mjtNum* qpos1, const mjtNum* qpos2) {
@@ -526,7 +621,7 @@ void mj_differentiatePos(const mjModel* m, mjtNum* qvel, mjtNum dt,
       vadr += 3;
       padr += 3;
 
-      // continute with rotations
+      // continue with rotations
       mjFALLTHROUGH;
 
     case mjJNT_BALL:
@@ -543,40 +638,49 @@ void mj_differentiatePos(const mjModel* m, mjtNum* qvel, mjtNum dt,
 }
 
 
+// integrate qpos with given qvel for given body indices
+void mj_integratePosInd(const mjModel* m, mjtNum* qpos, const mjtNum* qvel, mjtNum dt,
+                        const int* index, int nbody) {
+  for (int b=1; b < nbody; b++) {
+    int k = index ? index[b] : b;
+    int start = m->body_jntadr[k];
+    int end = start + m->body_jntnum[k];
+    for (int j=start; j < end; j++) {
+      // get addresses in qpos and qvel
+      int padr = m->jnt_qposadr[j];
+      int vadr = m->jnt_dofadr[j];
 
-// integrate qpos with given qvel
-void mj_integratePos(const mjModel* m, mjtNum* qpos, const mjtNum* qvel, mjtNum dt) {
-  // loop over joints
-  for (int j=0; j < m->njnt; j++) {
-    // get addresses in qpos and qvel
-    int padr = m->jnt_qposadr[j];
-    int vadr = m->jnt_dofadr[j];
+      switch ((mjtJoint) m->jnt_type[j]) {
+      case mjJNT_FREE:
+        // position update
+        for (int i=0; i < 3; i++) {
+          qpos[padr+i] += dt * qvel[vadr+i];
+        }
+        padr += 3;
+        vadr += 3;
 
-    switch ((mjtJoint) m->jnt_type[j]) {
-    case mjJNT_FREE:
-      // position update
-      for (int i=0; i < 3; i++) {
-        qpos[padr+i] += dt * qvel[vadr+i];
+        // continue with rotation update
+        mjFALLTHROUGH;
+
+      case mjJNT_BALL:
+        // quaternion update
+        mju_quatIntegrate(qpos+padr, qvel+vadr, dt);
+        break;
+
+      case mjJNT_HINGE:
+      case mjJNT_SLIDE:
+        // scalar update: same for rotation and translation
+        qpos[padr] += dt * qvel[vadr];
       }
-      padr += 3;
-      vadr += 3;
-
-      // continue with rotation update
-      mjFALLTHROUGH;
-
-    case mjJNT_BALL:
-      // quaternion update
-      mju_quatIntegrate(qpos+padr, qvel+vadr, dt);
-      break;
-
-    case mjJNT_HINGE:
-    case mjJNT_SLIDE:
-      // scalar update: same for rotation and translation
-      qpos[padr] += dt * qvel[vadr];
     }
   }
 }
 
+
+// integrate qpos with given qvel
+void mj_integratePos(const mjModel* m, mjtNum* qpos, const mjtNum* qvel, mjtNum dt) {
+  mj_integratePosInd(m, qpos, qvel, dt, NULL, m->nbody);
+}
 
 
 // normalize all quaternions in qpos-type vector
@@ -590,7 +694,6 @@ void mj_normalizeQuat(const mjModel* m, mjtNum* qpos) {
 }
 
 
-
 // return 1 if actuator i is disabled, 0 otherwise
 int mj_actuatorDisabled(const mjModel* m, int i) {
   int group = m->actuator_group[i];
@@ -600,6 +703,34 @@ int mj_actuatorDisabled(const mjModel* m, int i) {
     return m->opt.disableactuator & (1 << group) ? 1 : 0;
   }
 }
+
+
+// returns the next activation given current act_dot, after clamping
+mjtNum mj_nextActivation(const mjModel* m, const mjData* d,
+                         int actuator_id, int act_adr, mjtNum act_dot) {
+  mjtNum act = d->act[act_adr];
+
+  if (m->actuator_dyntype[actuator_id] == mjDYN_FILTEREXACT) {
+    // exact filter integration
+    // act_dot(0) = (ctrl-act(0)) / tau
+    // act(h) = act(0) + (ctrl-act(0)) (1 - exp(-h / tau))
+    //        = act(0) + act_dot(0) * tau * (1 - exp(-h / tau))
+    mjtNum tau = mju_max(mjMINVAL, m->actuator_dynprm[actuator_id*mjNDYN]);
+    act = act + act_dot * tau * (1 - mju_exp(-m->opt.timestep / tau));
+  } else {
+    // Euler integration
+    act = act + act_dot * m->opt.timestep;
+  }
+
+  // clamp to actrange
+  if (m->actuator_actlimited[actuator_id]) {
+    mjtNum* actrange = m->actuator_actrange + 2*actuator_id;
+    act = mju_clip(act, actrange[0], actrange[1]);
+  }
+
+  return act;
+}
+
 
 // sum all body masses
 mjtNum mj_getTotalmass(const mjModel* m) {
@@ -611,7 +742,6 @@ mjtNum mj_getTotalmass(const mjModel* m) {
 
   return res;
 }
-
 
 
 // scale all body masses and inertias to achieve specified total mass
@@ -631,12 +761,10 @@ void mj_setTotalmass(mjModel* m, mjtNum newmass) {
 }
 
 
-
 // version number
 int mj_version(void) {
   return mjVERSION;
 }
-
 
 
 // current version of MuJoCo as a null-terminated string
@@ -644,7 +772,6 @@ const char* mj_versionString(void) {
   static const char versionstring[] = mjVERSIONSTRING;
   return versionstring;
 }
-
 
 
 // return total size of data in a contact sensor bitfield specification
@@ -656,4 +783,166 @@ int mju_condataSize(int dataspec) {
     }
   }
   return size;
+}
+
+
+// return total size of data in a rangefinder sensor bitfield specification
+int mju_raydataSize(int dataspec) {
+  int size = 0;
+  for (int i=0; i < mjNRAYDATA; i++) {
+    if (dataspec & (1 << i)) {
+      size += mjRAYDATA_SIZE[i];
+    }
+  }
+  return size;
+}
+
+
+// compute camera pixel parameters from model, output are:
+//   pixel units: fx, fy (focal lengths), cx, cy (principal point)
+//   length units: extent
+void mju_camIntrinsics(const mjModel* m, int camid,
+                       mjtNum* fx, mjtNum* fy, mjtNum* cx, mjtNum* cy, mjtNum* extent) {
+  const int width = m->cam_resolution[2*camid];
+  const int height = m->cam_resolution[2*camid+1];
+  const float* sensorsize = m->cam_sensorsize + 2*camid;
+  const float* intrinsic = m->cam_intrinsic + 4*camid;
+  const mjtProjection projection = (mjtProjection)m->cam_projection[camid];
+
+  switch (projection) {
+  case mjPROJ_PERSPECTIVE:
+    if (sensorsize[0] && sensorsize[1]) {
+      // intrinsic-based perspective camera
+      *fx = intrinsic[0] / sensorsize[0] * width;
+      *fy = intrinsic[1] / sensorsize[1] * height;
+      *cx = intrinsic[2] / sensorsize[0] * width;
+      *cy = intrinsic[3] / sensorsize[1] * height;
+    } else {
+      // fovy-based perspective camera
+      *fx = *fy = 0.5 / mju_tan(m->cam_fovy[camid] * mjPI / 360.0) * height;
+      *cx = (mjtNum)width / 2.0;
+      *cy = (mjtNum)height / 2.0;
+    }
+    break;
+  case mjPROJ_ORTHOGRAPHIC:
+    // orthographic: normalize pixel offset to [-1, 1]
+    *fx = (mjtNum)width / 2.0;
+    *fy = (mjtNum)height / 2.0;
+    *cx = *fx;
+    *cy = *fy;
+    break;
+  }
+
+  // extent only used for orthographic cameras
+  *extent = m->cam_fovy[camid];
+}
+
+
+// read delayed ctrl value for actuator at given time
+mjtNum mj_readCtrl(const mjModel* m, const mjData* d, int id, mjtNum time, int interp) {
+  // validate actuator id
+  if (id < 0 || id >= m->nu) {
+    mjERROR("invalid actuator id %d", id);
+    return 0;
+  }
+
+  // no delay: return current ctrl value
+  int nsample = m->actuator_history[2*id];
+  if (nsample == 0) {
+    return d->ctrl[id];
+  }
+
+  // resolve interpolation order: use model's interp if argument is -1
+  if (interp < 0) interp = m->actuator_history[2*id+1];
+
+  // get buffer pointer and read from history buffer
+  mjtNum delay = m->actuator_delay[id];
+  const mjtNum* buf = d->history + m->actuator_historyadr[id];
+  mjtNum res;
+  const mjtNum* ptr = mju_historyRead(buf, nsample, /*dim=*/1, &res, time - delay, interp);
+  return ptr ? *ptr : res;
+}
+
+
+// read sensor value from history buffer at given time
+const mjtNum* mj_readSensor(const mjModel* m, const mjData* d, int id, mjtNum time,
+                            mjtNum* result, int interp) {
+  // validate sensor id
+  if (id < 0 || id >= m->nsensor) {
+    mjERROR("invalid sensor id %d", id);
+    return NULL;
+  }
+
+  // no history: return current sensor value
+  int nsample = m->sensor_history[2*id];
+  if (nsample == 0) {
+    return d->sensordata + m->sensor_adr[id];
+  }
+
+  // resolve interpolation order: use model's interp if argument is -1
+  if (interp < 0) interp = m->sensor_history[2*id+1];
+
+  // get buffer pointer and read from history buffer
+  int dim = m->sensor_dim[id];
+  mjtNum delay = m->sensor_delay[id];
+  const mjtNum* buf = d->history + m->sensor_historyadr[id];
+  return mju_historyRead(buf, nsample, dim, result, time - delay, interp);
+}
+
+
+// initialize history buffer for actuator
+void mj_initCtrlHistory(const mjModel* m, mjData* d, int id,
+                        const mjtNum* times, const mjtNum* values) {
+  // validate actuator id
+  if (id < 0 || id >= m->nu) {
+    mjERROR("invalid actuator id %d", id);
+    return;
+  }
+
+  // check that actuator has a history buffer
+  int nsample = m->actuator_history[2*id];
+  if (nsample == 0) {
+    mjERROR("actuator %d has no history buffer", id);
+    return;
+  }
+
+  // get buffer pointer
+  mjtNum* buf = d->history + m->actuator_historyadr[id];
+
+  // if times is NULL, use existing buffer times
+  const mjtNum* buf_times = times ? times : buf + 2;
+
+  // get existing user value (preserve it)
+  mjtNum user = buf[0];
+
+  // initialize history buffer
+  mju_historyInit(buf, nsample, 1, buf_times, values, user);
+}
+
+
+// initialize history buffer for sensor
+void mj_initSensorHistory(const mjModel* m, mjData* d, int id,
+                          const mjtNum* times, const mjtNum* values, mjtNum phase) {
+  // validate sensor id
+  if (id < 0 || id >= m->nsensor) {
+    mjERROR("invalid sensor id %d", id);
+    return;
+  }
+
+  // check that sensor has a history buffer
+  int nsample = m->sensor_history[2*id];
+  if (nsample == 0) {
+    mjERROR("sensor %d has no history buffer", id);
+    return;
+  }
+
+  // get buffer pointer and dimension
+  mjtNum* buf = d->history + m->sensor_historyadr[id];
+  int dim = m->sensor_dim[id];
+
+  // if times is NULL, use existing buffer times
+  const mjtNum* buf_times = times ? times : buf + 2;
+
+  // initialize history buffer with provided phase
+  mju_historyInit(buf, nsample, dim, buf_times, values, phase);
 }

@@ -14,6 +14,7 @@
 
 #include "engine/engine_print.h"
 
+#include <inttypes.h>  // IWYU pragma: keep
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -32,7 +33,7 @@
 #include "engine/engine_support.h"
 #include "engine/engine_util_errmem.h"
 #include "engine/engine_util_misc.h"
-#include "engine/engine_util_sparse.h"
+#include "engine/engine_vis_init.h"
 
 #ifdef MEMORY_SANITIZER
   #include <sanitizer/msan_interface.h>
@@ -41,16 +42,46 @@
 #define FLOAT_FORMAT "% -9.2g"
 #define FLOAT_FORMAT_MAX_LEN 20
 #define INT_FORMAT " %d"
-#define SIZE_T_FORMAT " %zu"
+#define SIZE_FORMAT " %" PRId64
 #define NAME_FORMAT "%-21s"
 
 
 
 //----------------------------------- static utility functions -------------------------------------
 
+static void printInt(FILE* fp, const char* name, int value) {
+  fprintf(fp, NAME_FORMAT, name);
+  fprintf(fp, INT_FORMAT, value);
+  fprintf(fp, "\n");
+}
+
+static void printStr(FILE* fp, const char* name, const char* value) {
+  fprintf(fp, NAME_FORMAT, name);
+  fprintf(fp, "%s", value ? value : "");
+  fprintf(fp, "\n");
+}
+
+static void printNum(FILE* fp, const char* name, float value, const char* float_format) {
+  fprintf(fp, NAME_FORMAT, name);
+  fprintf(fp, float_format, value);
+  fprintf(fp, "\n");
+}
+
+static void printArr(FILE* fp, const char* name, const float* data, int n, const char* float_format) {
+  if (!data) {
+    return;
+  }
+  fprintf(fp, NAME_FORMAT, name);
+  for (int i = 0; i < n; ++i) {
+    fprintf(fp, float_format, data[i]);
+    fprintf(fp, " ");
+  }
+  fprintf(fp, "\n");
+}
+
 // print 2D array of mjtNum into file
-static void printArray(const char* str, int nr, int nc, const mjtNum* data, FILE* fp,
-                       const char* float_format) {
+static void printArray2d(const char* str, int nr, int nc, const mjtNum* data, FILE* fp,
+                         const char* float_format) {
   if (!data) {
     return;
   }
@@ -70,7 +101,7 @@ static void printArray(const char* str, int nr, int nc, const mjtNum* data, FILE
 
 
 // print 2D array of int into file
-static void printArrayInt(const char* str, int nr, int nc, const int* data, FILE* fp) {
+static void printArray2dInt(const char* str, int nr, int nc, const int* data, FILE* fp) {
   if (!data) {
     return;
   }
@@ -88,6 +119,50 @@ static void printArrayInt(const char* str, int nr, int nc, const int* data, FILE
   }
 }
 
+
+// print history buffer with semantic labels
+static void printDelayBuffer(const char* name, const mjtNum* buf, int nhistory, int dim,
+                             FILE* fp, const char* float_format) {
+  if (!buf || nhistory <= 0) {
+    return;
+  }
+  fprintf(fp, "  %s:\n", name);
+
+  // user value (first slot)
+  fprintf(fp, "    phase  = ");
+  fprintf(fp, float_format, buf[0]);
+  fprintf(fp, "\n");
+
+  // cursor (second slot, stored as mjtNum but is an integer)
+  fprintf(fp, "    cursor =  %d\n", (int)buf[1]);
+
+  // timestamps
+  const mjtNum* times = buf + 2;
+  fprintf(fp, "    times  = ");
+  for (int i = 0; i < nhistory; i++) {
+    fprintf(fp, float_format, times[i]);
+  }
+  fprintf(fp, "\n");
+
+  // values
+  const mjtNum* values = times + nhistory;
+  if (dim == 1) {
+    fprintf(fp, "    values = ");
+    for (int i = 0; i < nhistory; i++) {
+      fprintf(fp, float_format, values[i]);
+    }
+    fprintf(fp, "\n");
+  } else {
+    fprintf(fp, "    values:\n");
+    for (int i = 0; i < nhistory; i++) {
+      fprintf(fp, "      [%d] =", i);
+      for (int j = 0; j < dim; j++) {
+        fprintf(fp, float_format, values[i*dim + j]);
+      }
+      fprintf(fp, "\n");
+    }
+  }
+}
 
 
 // print sparse matrix
@@ -163,7 +238,6 @@ static void printBlockArray(const char* str, const mjtNum* data, int nr, int nc,
 }
 
 
-
 // print sparse inertia-like matrix
 static void printInertia(const char* str, const mjtNum* mat, const mjModel* m,
                          FILE* fp, const char* float_format) {
@@ -198,7 +272,6 @@ static void printInertia(const char* str, const mjtNum* mat, const mjModel* m,
   }
   fprintf(fp, "\n");
 }
-
 
 
 // print sparse matrix structure
@@ -236,7 +309,6 @@ void mj_printSparsity(const char* str, int nr, int nc, const int* rowadr, const 
   for (int c=0; c < nc+2; c++) fprintf(fp, "-");
   fprintf(fp, "\n\n");
 }
-
 
 
 // print block-diagonal sparse matrix structure
@@ -298,7 +370,6 @@ void mj_printBlockSparsity(const char* str, int nr, int nc, int nisland,
 }
 
 
-
 // print vector
 static void printVector(const char* str, const mjtNum* data, int n, FILE* fp,
                         const char* float_format) {
@@ -317,40 +388,40 @@ static void printVector(const char* str, const mjtNum* data, int n, FILE* fp,
 }
 
 
-
 // print human readable memory size
 static const char* memorySize(size_t nbytes) {
-  static mjTHREADLOCAL char message[20];
+  static mjTHREADLOCAL char message[32];
   int k = 1024;
 
   if (nbytes < k) {
     snprintf(message, sizeof(message), "%5zu bytes", nbytes);
-  } else if (nbytes < k*k) {
-    snprintf(message, sizeof(message), "%5.1f KB", (double)nbytes / k);
-  } else if (nbytes < k*k*k) {
-    snprintf(message, sizeof(message), "%5.1f MB", (double)nbytes / (k*k));
   } else {
-    snprintf(message, sizeof(message), "%5.1f GB", (double)nbytes / (k*k*k));
+    snprintf(message, sizeof(message), "%7.0f KB", (double)nbytes / (k));
   }
 
   return message;
 }
 
 
-
 // return memory footprint of all significant mesh-related arrays
 static size_t sizeMesh(const mjModel* m) {
   size_t nbytes = 0;
-  nbytes += sizeof(float) * 3*m->nmeshvert;        // mesh_vert
-  nbytes += sizeof(float) * 3*m->nmeshnormal;      // mesh_normal
-  nbytes += sizeof(float) * 2*m->nmeshtexcoord;    // mesh_texcoord
-  nbytes += sizeof(int)   * 3*m->nmeshface;        // mesh_face
-  nbytes += sizeof(int)   * 3*m->nmeshface;        // mesh_facenormal
-  nbytes += sizeof(int)   * 3*m->nmeshface;        // mesh_facetexcoord
-  nbytes += sizeof(int)   * m->nmeshgraph;         // mesh_graph
+  nbytes += sizeof(float)  * 3*m->nmeshvert;      // mesh_vert
+  nbytes += sizeof(float)  * 3*m->nmeshnormal;    // mesh_normal
+  nbytes += sizeof(float)  * 2*m->nmeshtexcoord;  // mesh_texcoord
+  nbytes += sizeof(int)    * 3*m->nmeshface;      // mesh_face
+  nbytes += sizeof(int)    * 3*m->nmeshface;      // mesh_facenormal
+  nbytes += sizeof(int)    * 3*m->nmeshface;      // mesh_facetexcoord
+  nbytes += sizeof(int)    * m->nmeshgraph;       // mesh_graph
+  nbytes += sizeof(mjtNum) * 3*m->nmeshpoly;      // mesh_polynormal
+  nbytes += sizeof(int)    * m->nmeshpoly;        // mesh_polyvertadr
+  nbytes += sizeof(int)    * m->nmeshpoly;        // mesh_polyvertnum
+  nbytes += sizeof(int)    * m->nmeshpolyvert;    // mesh_polyvert
+  nbytes += sizeof(int)    * m->nmeshvert;        // mesh_polymapadr
+  nbytes += sizeof(int)    * m->nmeshvert;        // mesh_polymapnum
+  nbytes += sizeof(int)    * m->nmeshpolymap;     // mesh_polymap
   return nbytes;
 }
-
 
 
 // return memory footprint of all significant skin-related arrays
@@ -369,6 +440,20 @@ static size_t sizeSkin(const mjModel* m) {
   return nbytes;
 }
 
+
+// return memory footprint of all BVH-related arrays
+static size_t sizeBVH(const mjModel* m) {
+  size_t nbytes = 0;
+  nbytes += sizeof(int)    * m->nbvh;               // bvh_depth
+  nbytes += sizeof(int)    * 2*m->nbvh;             // bvh_child
+  nbytes += sizeof(int)    * m->nbvh;               // bvh_nodeid
+  nbytes += sizeof(mjtNum) * 6*m->nbvhstatic;       // bvh_aabb
+  nbytes += sizeof(int)    * m->noct;               // oct_depth
+  nbytes += sizeof(int)    * 8*m->noct;             // oct_child
+  nbytes += sizeof(mjtNum) * 6*m->noct;             // oct_aabb
+  nbytes += sizeof(mjtNum) * 8*m->noct;             // oct_coeff
+  return nbytes;
+}
 
 
 // return whether float_format is a valid format string for a single float
@@ -483,16 +568,18 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
 
   // memory footprint
   fprintf(fp, "MEMORY\n");
-  fprintf(fp, "  total         %s\n", memorySize(mj_sizeModel(m)));
-  if (m->nmesh) {
-    fprintf(fp, "  meshes        %s\n", memorySize(sizeMesh(m)));
-  }
-  if (m->ntex) {
-    fprintf(fp, "  textures      %s\n", memorySize(m->ntexdata));
-  }
-  if (m->nskin) {
-    fprintf(fp, "  skins         %s\n", memorySize(sizeSkin(m)));
-  }
+  size_t sz_total = mj_sizeModel(m);
+  size_t sz_mesh = m->nmesh ? sizeMesh(m) : 0;
+  size_t sz_bvh = (m->nbvh || m->noct) ? sizeBVH(m) : 0;
+  size_t sz_tex = m->ntex ? m->ntexdata : 0;
+  size_t sz_skin = m->nskin ? sizeSkin(m) : 0;
+  size_t sz_other = sz_total - sz_mesh - sz_bvh - sz_tex - sz_skin;
+  fprintf(fp, "  total       %s\n", memorySize(sz_total));
+  if (sz_mesh)  fprintf(fp, "  meshes      %s\n", memorySize(sz_mesh));
+  if (sz_bvh)   fprintf(fp, "  bvhs        %s\n", memorySize(sz_bvh));
+  if (sz_tex)   fprintf(fp, "  textures    %s\n", memorySize(sz_tex));
+  if (sz_skin)  fprintf(fp, "  skins       %s\n", memorySize(sz_skin));
+  if (sz_other) fprintf(fp, "  other       %s\n", memorySize(sz_other));
   fprintf(fp, "\n");
 
 
@@ -502,14 +589,14 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
   if (m->name) {                                  \
     const char* format = _Generic(                \
         m->name,                                  \
-        size_t : SIZE_T_FORMAT,                   \
+        mjtSize : SIZE_FORMAT,                    \
         default : INT_FORMAT);                    \
     fprintf(fp, NAME_FORMAT, "  " #name);         \
     fprintf(fp, format, m->name);                 \
     fprintf(fp, "\n");                            \
   }
 
-  MJMODEL_INTS
+  MJMODEL_SIZES
 #undef X
   fprintf(fp, "\n");
 
@@ -594,7 +681,7 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
   (void)nu;
   (void)nmocap;
 
-  const int* object_class;
+  const mjtSize* object_class;
 
 #define X(type, name, num, sz)                                              \
   if (&m->num == object_class && sz > 0) {                                  \
@@ -603,6 +690,7 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
                                   float:   float_format,                    \
                                   int:     INT_FORMAT,                      \
                                   mjtByte: INT_FORMAT,                      \
+                                  mjtSize: SIZE_FORMAT,                     \
                                   default: NULL);                           \
     if (format) {                                                           \
       fprintf(fp, "  ");                                                    \
@@ -643,6 +731,14 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
     MJMODEL_POINTERS_DOF
   }
   if (m->nv) fprintf(fp, "\n");
+
+  // trees
+  object_class = &m->ntree;
+  for (int i=0; i < m->ntree; i++) {
+    fprintf(fp, "\nTREE %d:\n", i);
+    MJMODEL_POINTERS_TREE
+  }
+  if (m->ntree) fprintf(fp, "\n");
 
   // geoms
   object_class = &m->ngeom;
@@ -992,26 +1088,26 @@ void mj_printFormattedModel(const mjModel* m, const char* filename, const char* 
   // B sparse structure
   mj_printSparsity("B: body-dof matrix", m->nbody, m->nv, m->B_rowadr, NULL, m->B_rownnz, NULL,
                    m->B_colind, fp);
-  printArrayInt("B_ROWNNZ", 1, m->nbody, m->B_rownnz, fp);
-  printArrayInt("B_ROWADR", 1, m->nbody, m->B_rowadr, fp);
-  printArrayInt("B_COLIND", 1, m->nB,    m->B_colind, fp);
+  printArray2dInt("B_ROWNNZ", 1, m->nbody, m->B_rownnz, fp);
+  printArray2dInt("B_ROWADR", 1, m->nbody, m->B_rowadr, fp);
+  printArray2dInt("B_COLIND", 1, m->nB,    m->B_colind, fp);
 
   // M sparse structure
   mj_printSparsity("M: reduced inertia matrix", m->nv, m->nv, m->M_rowadr, NULL, m->M_rownnz,
                    NULL, m->M_colind, fp);
-  printArrayInt("M_ROWNNZ", 1, m->nv, m->M_rownnz, fp);
-  printArrayInt("M_ROWADR", 1, m->nv, m->M_rowadr, fp);
-  printArrayInt("M_COLIND", 1, m->nC, m->M_colind, fp);
-  printArrayInt("MAPM2M",   1, m->nC, m->mapM2M,   fp);
+  printArray2dInt("M_ROWNNZ", 1, m->nv, m->M_rownnz, fp);
+  printArray2dInt("M_ROWADR", 1, m->nv, m->M_rowadr, fp);
+  printArray2dInt("M_COLIND", 1, m->nC, m->M_colind, fp);
+  printArray2dInt("MAPM2M",   1, m->nC, m->mapM2M,   fp);
 
   // D sparse structure
   mj_printSparsity("D: dof-dof matrix", m->nv, m->nv,
                    m->D_rowadr, m->D_diag, m->D_rownnz, NULL, m->D_colind, fp);
-  printArrayInt("D_ROWNNZ", 1, m->nv, m->D_rownnz, fp);
-  printArrayInt("D_ROWADR", 1, m->nv, m->D_rowadr, fp);
-  printArrayInt("D_COLIND", 1, m->nD, m->D_colind, fp);
-  printArrayInt("MAPM2D",   1, m->nD, m->mapM2D,   fp);
-  printArrayInt("MAPD2M",   1, m->nC, m->mapD2M,   fp);
+  printArray2dInt("D_ROWNNZ", 1, m->nv, m->D_rownnz, fp);
+  printArray2dInt("D_ROWADR", 1, m->nv, m->D_rowadr, fp);
+  printArray2dInt("D_COLIND", 1, m->nD, m->D_colind, fp);
+  printArray2dInt("MAPM2D",   1, m->nD, m->mapM2D,   fp);
+  printArray2dInt("MAPD2M",   1, m->nC, m->mapD2M,   fp);
 
   // signature
   fprintf(fp, "\nSIGNATURE\n");
@@ -1080,11 +1176,11 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
 #endif
 
   fprintf(fp, "MEMORY\n");
-  fprintf(fp, "  total           %s\n",   memorySize(sizeof(mjData) + d->nbuffer + d->narena));
-  fprintf(fp, "  struct          %s\n",   memorySize(sizeof(mjData)));
-  fprintf(fp, "  buffer          %s\n",   memorySize(d->nbuffer));
+  fprintf(fp, "  total         %s\n",   memorySize(sizeof(mjData) + d->nbuffer + d->narena));
+  fprintf(fp, "  struct        %s\n",   memorySize(sizeof(mjData)));
+  fprintf(fp, "  buffer        %s\n",   memorySize(d->nbuffer));
   double arena_percent = 100 * d->maxuse_arena/(double)(d->narena);
-  fprintf(fp, "  arena           %s, used %.1f%%\n\n", memorySize(d->narena), arena_percent);
+  fprintf(fp, "  arena         %s, used %.1f%%\n\n", memorySize(d->narena), arena_percent);
 
   // ---------------------------------- print mjData fields
 
@@ -1097,7 +1193,8 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
     const char* format = _Generic(                                            \
         d->name,                                                              \
         int : INT_FORMAT,                                                     \
-        size_t : SIZE_T_FORMAT,                                               \
+        mjtSize : SIZE_FORMAT,                                                \
+        mjtByte : INT_FORMAT,                                                 \
         default : NULL);                                                      \
     if (format) {                                                             \
       fprintf(fp, "  ");                                                      \
@@ -1186,13 +1283,43 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
   fprintf(fp, float_format, d->time);
   fprintf(fp, "\n\n");
 
-  printArray("QPOS", m->nq, 1, d->qpos, fp, float_format);
-  printArray("QVEL", m->nv, 1, d->qvel, fp, float_format);
-  printArray("ACT", m->na, 1, d->act, fp, float_format);
-  printArray("QACC_WARMSTART", m->nv, 1, d->qacc_warmstart, fp, float_format);
-  printArray("CTRL", m->nu, 1, d->ctrl, fp, float_format);
-  printArray("QFRC_APPLIED", m->nv, 1, d->qfrc_applied, fp, float_format);
-  printArray("XFRC_APPLIED", m->nbody, 6, d->xfrc_applied, fp, float_format);
+  printArray2d("QPOS", m->nq, 1, d->qpos, fp, float_format);
+  printArray2d("QVEL", m->nv, 1, d->qvel, fp, float_format);
+  printArray2d("ACT", m->na, 1, d->act, fp, float_format);
+
+  // print history buffers with semantic structure
+  if (m->nhistory) {
+    fprintf(fp, "DELAY\n");
+
+    // actuator history buffers
+    for (int i = 0; i < m->nu; i++) {
+      int adr = m->actuator_historyadr[i];
+      if (adr >= 0) {
+        char name[100];
+        const char* actuator_name = mj_id2name(m, mjOBJ_ACTUATOR, i);
+        snprintf(name, sizeof(name), "actuator %d '%s'", i, actuator_name ? actuator_name : "");
+        printDelayBuffer(name, d->history + adr, m->actuator_history[2*i], 1, fp, float_format);
+      }
+    }
+
+    // sensor history buffers
+    for (int i = 0; i < m->nsensor; i++) {
+      int adr = m->sensor_historyadr[i];
+      if (adr >= 0) {
+        char name[100];
+        const char* sensor_name = mj_id2name(m, mjOBJ_SENSOR, i);
+        snprintf(name, sizeof(name), "sensor %d  '%s'", i, sensor_name ? sensor_name : "");
+        printDelayBuffer(name, d->history + adr, m->sensor_history[2*i], m->sensor_dim[i],
+                         fp, float_format);
+      }
+    }
+
+    fprintf(fp, "\n");
+  }
+  printArray2d("QACC_WARMSTART", m->nv, 1, d->qacc_warmstart, fp, float_format);
+  printArray2d("CTRL", m->nu, 1, d->ctrl, fp, float_format);
+  printArray2d("QFRC_APPLIED", m->nv, 1, d->qfrc_applied, fp, float_format);
+  printArray2d("XFRC_APPLIED", m->nbody, 6, d->xfrc_applied, fp, float_format);
   if (m->neq) {
     fprintf(fp, NAME_FORMAT, "EQ_ACTIVE");
     for (int c=0; c < m->neq; c++) {
@@ -1200,56 +1327,51 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
     }
     fprintf(fp, "\n\n");
   }
-  printArray("MOCAP_POS", m->nmocap, 3, d->mocap_pos, fp, float_format);
-  printArray("MOCAP_QUAT", m->nmocap, 4, d->mocap_quat, fp, float_format);
-  printArray("QACC", m->nv, 1, d->qacc, fp, float_format);
-  printArray("ACT_DOT", m->na, 1, d->act_dot, fp, float_format);
-  printArray("USERDATA", m->nuserdata, 1, d->userdata, fp, float_format);
-  printArray("SENSOR", m->nsensordata, 1, d->sensordata, fp, float_format);
+  printArray2d("MOCAP_POS", m->nmocap, 3, d->mocap_pos, fp, float_format);
+  printArray2d("MOCAP_QUAT", m->nmocap, 4, d->mocap_quat, fp, float_format);
+  printArray2d("QACC", m->nv, 1, d->qacc, fp, float_format);
+  printArray2d("ACT_DOT", m->na, 1, d->act_dot, fp, float_format);
+  printArray2d("USERDATA", m->nuserdata, 1, d->userdata, fp, float_format);
+  printArray2d("SENSOR", m->nsensordata, 1, d->sensordata, fp, float_format);
+  printArray2dInt("TREE_ASLEEP", m->ntree, 1, d->tree_asleep, fp);
 
-  printArray("XPOS", m->nbody, 3, d->xpos, fp, float_format);
-  printArray("XQUAT", m->nbody, 4, d->xquat, fp, float_format);
-  printArray("XMAT", m->nbody, 9, d->xmat, fp, float_format);
-  printArray("XIPOS", m->nbody, 3, d->xipos, fp, float_format);
-  printArray("XIMAT", m->nbody, 9, d->ximat, fp, float_format);
-  printArray("XANCHOR", m->njnt, 3, d->xanchor, fp, float_format);
-  printArray("XAXIS", m->njnt, 3, d->xaxis, fp, float_format);
-  printArray("GEOM_XPOS", m->ngeom, 3, d->geom_xpos, fp, float_format);
-  printArray("GEOM_XMAT", m->ngeom, 9, d->geom_xmat, fp, float_format);
-  printArray("SITE_XPOS", m->nsite, 3, d->site_xpos, fp, float_format);
-  printArray("SITE_XMAT", m->nsite, 9, d->site_xmat, fp, float_format);
-  printArray("CAM_XPOS", m->ncam, 3, d->cam_xpos, fp, float_format);
-  printArray("CAM_XMAT", m->ncam, 9, d->cam_xmat, fp, float_format);
-  printArray("LIGHT_XPOS", m->nlight, 3, d->light_xpos, fp, float_format);
-  printArray("LIGHT_XDIR", m->nlight, 3, d->light_xdir, fp, float_format);
+  printArray2d("XPOS", m->nbody, 3, d->xpos, fp, float_format);
+  printArray2d("XQUAT", m->nbody, 4, d->xquat, fp, float_format);
+  printArray2d("XMAT", m->nbody, 9, d->xmat, fp, float_format);
+  printArray2d("XIPOS", m->nbody, 3, d->xipos, fp, float_format);
+  printArray2d("XIMAT", m->nbody, 9, d->ximat, fp, float_format);
+  printArray2d("XANCHOR", m->njnt, 3, d->xanchor, fp, float_format);
+  printArray2d("XAXIS", m->njnt, 3, d->xaxis, fp, float_format);
+  printArray2d("GEOM_XPOS", m->ngeom, 3, d->geom_xpos, fp, float_format);
+  printArray2d("GEOM_XMAT", m->ngeom, 9, d->geom_xmat, fp, float_format);
+  printArray2d("SITE_XPOS", m->nsite, 3, d->site_xpos, fp, float_format);
+  printArray2d("SITE_XMAT", m->nsite, 9, d->site_xmat, fp, float_format);
+  printArray2d("CAM_XPOS", m->ncam, 3, d->cam_xpos, fp, float_format);
+  printArray2d("CAM_XMAT", m->ncam, 9, d->cam_xmat, fp, float_format);
+  printArray2d("LIGHT_XPOS", m->nlight, 3, d->light_xpos, fp, float_format);
+  printArray2d("LIGHT_XDIR", m->nlight, 3, d->light_xdir, fp, float_format);
 
-  printArray("SUBTREE_COM", m->nbody, 3, d->subtree_com, fp, float_format);
-  printArray("CDOF", m->nv, 6, d->cdof, fp, float_format);
-  printArray("CINERT", m->nbody, 10, d->cinert, fp, float_format);
+  printArray2d("SUBTREE_COM", m->nbody, 3, d->subtree_com, fp, float_format);
+  printArray2d("CDOF", m->nv, 6, d->cdof, fp, float_format);
+  printArray2d("CINERT", m->nbody, 10, d->cinert, fp, float_format);
 
-  printArray("FLEXVERT_XPOS", m->nflexvert, 3, d->flexvert_xpos, fp, float_format);
-  printArray("FLEXELEM_AABB", m->nflexelem, 6, d->flexelem_aabb, fp, float_format);
+  printArray2d("FLEXVERT_XPOS", m->nflexvert, 3, d->flexvert_xpos, fp, float_format);
+  printArray2d("FLEXELEM_AABB", m->nflexelem, 6, d->flexelem_aabb, fp, float_format);
+  mj_printSparsity("FLEXEDGE_J: flex edge connectivity", m->nflexedge, m->nv,
+                    m->flexedge_J_rowadr, NULL, m->flexedge_J_rownnz, NULL, m->flexedge_J_colind,
+                    fp);
+  printSparse("FLEXEDGE_J", d->flexedge_J, m->nflexedge, m->flexedge_J_rownnz,
+                            m->flexedge_J_rowadr, m->flexedge_J_colind, fp, float_format);
+  printArray2d("FLEXEDGE_LENGTH", m->nflexedge, 1, d->flexedge_length, fp, float_format);
+
+  printArray2d("TEN_LENGTH", m->ntendon, 1, d->ten_length, fp, float_format);
   if (!mj_isSparse(m)) {
-    printArray("FLEXEDGE_J", m->nflexedge, m->nv, d->flexedge_J, fp, float_format);
-  } else {
-    mj_printSparsity("FLEXEDGE_J: flex edge connectivity", m->nflexedge, m->nv,
-                     d->flexedge_J_rowadr, NULL, d->flexedge_J_rownnz, NULL, d->flexedge_J_colind,
-                     fp);
-    printArrayInt("FLEXEDGE_J_ROWNNZ", m->nflexedge, 1, d->flexedge_J_rownnz, fp);
-    printArrayInt("FLEXEDGE_J_ROWADR", m->nflexedge, 1, d->flexedge_J_rowadr, fp);
-    printSparse("FLEXEDGE_J", d->flexedge_J, m->nflexedge, d->flexedge_J_rownnz,
-                              d->flexedge_J_rowadr, d->flexedge_J_colind, fp, float_format);
-  }
-  printArray("FLEXEDGE_LENGTH", m->nflexedge, 1, d->flexedge_length, fp, float_format);
-
-  printArray("TEN_LENGTH", m->ntendon, 1, d->ten_length, fp, float_format);
-  if (!mj_isSparse(m)) {
-    printArray("TEN_MOMENT", m->ntendon, m->nv, d->ten_J, fp, float_format);
+    printArray2d("TEN_MOMENT", m->ntendon, m->nv, d->ten_J, fp, float_format);
   } else {
     mj_printSparsity("TEN_J: tendon moments", m->ntendon, m->nv, d->ten_J_rowadr, NULL,
                      d->ten_J_rownnz, NULL, d->ten_J_colind, fp);
-    printArrayInt("TEN_J_ROWNNZ", m->ntendon, 1, d->ten_J_rownnz, fp);
-    printArrayInt("TEN_J_ROWADR", m->ntendon, 1, d->ten_J_rowadr, fp);
+    printArray2dInt("TEN_J_ROWNNZ", m->ntendon, 1, d->ten_J_rownnz, fp);
+    printArray2dInt("TEN_J_ROWADR", m->ntendon, 1, d->ten_J_rowadr, fp);
     printSparse("TEN_J", d->ten_J, m->ntendon, d->ten_J_rownnz,
                 d->ten_J_rowadr, d->ten_J_colind, fp, float_format);
   }
@@ -1262,18 +1384,18 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
     fprintf(fp, "\n");
   }
 
-  printArray("ACTUATOR_LENGTH", m->nu, 1, d->actuator_length, fp, float_format);
+  printArray2d("ACTUATOR_LENGTH", m->nu, 1, d->actuator_length, fp, float_format);
   mj_printSparsity("actuator_moment", m->nu, m->nv,
                    d->moment_rowadr, NULL, d->moment_rownnz, NULL, d->moment_colind, fp);
   printSparse("ACTUATOR_MOMENT", d->actuator_moment, m->nu, d->moment_rownnz,
               d->moment_rowadr, d->moment_colind, fp, float_format);
-  printArray("CRB", m->nbody, 10, d->crb, fp, float_format);
+  printArray2d("CRB", m->nbody, 10, d->crb, fp, float_format);
   printInertia("QM", d->qM, m, fp, float_format);
   printSparse("M", d->M, m->nv, m->M_rownnz,
               m->M_rowadr, m->M_colind, fp, float_format);
   printSparse("QLD", d->qLD, m->nv, m->M_rownnz,
               m->M_rowadr, m->M_colind, fp, float_format);
-  printArray("QLDIAGINV", m->nv, 1, d->qLDiagInv, fp, float_format);
+  printArray2d("QLDIAGINV", m->nv, 1, d->qLDiagInv, fp, float_format);
   if (d->nisland) {
     // the static full inertia structure is already printed in printModel, so we only repeat it here
     // if islands are present, for comparison
@@ -1288,8 +1410,15 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
 
   if (!mju_isZero(d->qHDiagInv, m->nv)) {
     printSparse("QH", d->qH, m->nv, m->M_rownnz, m->M_rowadr, m->M_colind, fp, float_format);
-    printArray("QHDIAGINV", m->nv, 1, d->qHDiagInv, fp, float_format);
+    printArray2d("QHDIAGINV", m->nv, 1, d->qHDiagInv, fp, float_format);
   }
+
+  // computed sleep state
+  printArray2dInt("TREE_AWAKE", 1, m->ntree, d->tree_awake, fp);
+  printArray2dInt("BODY_AWAKE", 1, m->nbody, d->body_awake, fp);
+  printArray2dInt("BODY_AWAKE_IND", 1, d->nbody_awake, d->body_awake_ind, fp);
+  printArray2dInt("PARENT_AWAKE_IND", 1, d->nparent_awake, d->parent_awake_ind, fp);
+  printArray2dInt("DOF_AWAKE_IND", 1, d->nv_awake, d->dof_awake_ind, fp);
 
   // print qDeriv
   if (!mju_isZero(d->qDeriv, m->nD)) {
@@ -1303,7 +1432,7 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
   }
 
   // contact
-  fprintf(fp, "CONTACT\n");
+  if (d->ncon) fprintf(fp, "CONTACT\n");
   for (int i=0; i < d->ncon; i++) {
     fprintf(fp, "  %d:\n     dim           %d\n", i, d->contact[i].dim);
     int g1 = d->contact[i].geom[0];
@@ -1348,21 +1477,21 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
   }
   if (d->ncon) fprintf(fp, "\n");
 
-  printArrayInt("EFC_TYPE", d->nefc, 1, d->efc_type, fp);
-  printArrayInt("EFC_ID", d->nefc, 1, d->efc_id, fp);
+  printArray2dInt("EFC_TYPE", d->nefc, 1, d->efc_type, fp);
+  printArray2dInt("EFC_ID", d->nefc, 1, d->efc_id, fp);
 
   if (!mj_isSparse(m)) {
-    printArray("EFC_J", d->nefc, m->nv, d->efc_J, fp, float_format);
+    printArray2d("EFC_J", d->nefc, m->nv, d->efc_J, fp, float_format);
     if (d->nisland) {
       printBlockArray("IEFC_J", d->iefc_J, d->nefc, d->nidof,
                       d->nisland, d->island_nefc, d->island_nv,
                       d->island_iefcadr, d->island_idofadr,
                       fp, float_format);
     }
-    printArray("EFC_AR", d->nefc, d->nefc, d->efc_AR, fp, float_format);
+    printArray2d("EFC_AR", d->nefc, d->nefc, d->efc_AR, fp, float_format);
   } else {
-    printArrayInt("EFC_J_ROWNNZ", d->nefc, 1, d->efc_J_rownnz, fp);
-    printArrayInt("EFC_J_ROWADR", d->nefc, 1, d->efc_J_rowadr, fp);
+    printArray2dInt("EFC_J_ROWNNZ", d->nefc, 1, d->efc_J_rownnz, fp);
+    printArray2dInt("EFC_J_ROWADR", d->nefc, 1, d->efc_J_rowadr, fp);
     printSparse("EFC_J", d->efc_J, d->nefc, d->efc_J_rownnz,
                 d->efc_J_rowadr, d->efc_J_colind, fp, float_format);
     mj_printSparsity("J: constraint Jacobian", d->nefc, m->nv, d->efc_J_rowadr, NULL,
@@ -1377,8 +1506,8 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
     }
 
     if (mj_isDual(m)) {
-      printArrayInt("EFC_AR_ROWNNZ", d->nefc, 1, d->efc_AR_rownnz, fp);
-      printArrayInt("EFC_AR_ROWADR", d->nefc, 1, d->efc_AR_rowadr, fp);
+      printArray2dInt("EFC_AR_ROWNNZ", d->nefc, 1, d->efc_AR_rownnz, fp);
+      printArray2dInt("EFC_AR_ROWADR", d->nefc, 1, d->efc_AR_rowadr, fp);
       printSparse("EFC_AR", d->efc_AR, d->nefc, d->efc_AR_rownnz,
                   d->efc_AR_rowadr, d->efc_AR_colind, fp, float_format);
       mj_printSparsity("efc_AR: inverse constraint inertia", d->nefc, d->nefc, d->efc_AR_rowadr,
@@ -1386,53 +1515,58 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
     }
   }
 
-  printArray("EFC_POS", d->nefc, 1, d->efc_pos, fp, float_format);
-  printArray("EFC_MARGIN", d->nefc, 1, d->efc_margin, fp, float_format);
-  printArray("EFC_FRICTIONLOSS", d->nefc, 1, d->efc_frictionloss, fp, float_format);
-  printArray("EFC_DIAGAPPROX", d->nefc, 1, d->efc_diagApprox, fp, float_format);
-  printArray("EFC_KBIP", d->nefc, 4, d->efc_KBIP, fp, float_format);
-  printArray("EFC_D", d->nefc, 1, d->efc_D, fp, float_format);
-  printArray("EFC_R", d->nefc, 1, d->efc_R, fp, float_format);
+  printArray2d("EFC_POS", d->nefc, 1, d->efc_pos, fp, float_format);
+  printArray2d("EFC_MARGIN", d->nefc, 1, d->efc_margin, fp, float_format);
+  printArray2d("EFC_FRICTIONLOSS", d->nefc, 1, d->efc_frictionloss, fp, float_format);
+  printArray2d("EFC_DIAGAPPROX", d->nefc, 1, d->efc_diagApprox, fp, float_format);
+  printArray2d("EFC_KBIP", d->nefc, 4, d->efc_KBIP, fp, float_format);
+  printArray2d("EFC_D", d->nefc, 1, d->efc_D, fp, float_format);
+  printArray2d("EFC_R", d->nefc, 1, d->efc_R, fp, float_format);
 
-  printArray("FLEXEDGE_VELOCITY", m->nflexedge, 1, d->flexedge_velocity, fp, float_format);
-  printArray("TEN_VELOCITY", m->ntendon, 1, d->ten_velocity, fp, float_format);
-  printArray("ACTUATOR_VELOCITY", m->nu, 1, d->actuator_velocity, fp, float_format);
+  printArray2d("FLEXEDGE_VELOCITY", m->nflexedge, 1, d->flexedge_velocity, fp, float_format);
+  printArray2d("TEN_VELOCITY", m->ntendon, 1, d->ten_velocity, fp, float_format);
+  printArray2d("ACTUATOR_VELOCITY", m->nu, 1, d->actuator_velocity, fp, float_format);
 
-  printArray("CVEL", m->nbody, 6, d->cvel, fp, float_format);
-  printArray("CDOF_DOT", m->nv, 6, d->cdof_dot, fp, float_format);
+  printArray2d("CVEL", m->nbody, 6, d->cvel, fp, float_format);
+  printArray2d("CDOF_DOT", m->nv, 6, d->cdof_dot, fp, float_format);
 
-  printArray("QFRC_BIAS", m->nv, 1, d->qfrc_bias, fp, float_format);
+  printArray2d("QFRC_BIAS", m->nv, 1, d->qfrc_bias, fp, float_format);
 
-  printArray("QFRC_SPRING",   m->nv, 1, d->qfrc_spring,   fp, float_format);
-  printArray("QFRC_DAMPER",   m->nv, 1, d->qfrc_damper,   fp, float_format);
-  printArray("QFRC_GRAVCOMP", m->nv, 1, d->qfrc_gravcomp, fp, float_format);
-  printArray("QFRC_FLUID",    m->nv, 1, d->qfrc_fluid,    fp, float_format);
-  printArray("QFRC_PASSIVE",  m->nv, 1, d->qfrc_passive,  fp, float_format);
+  printArray2d("QFRC_SPRING",   m->nv, 1, d->qfrc_spring,   fp, float_format);
+  printArray2d("QFRC_DAMPER",   m->nv, 1, d->qfrc_damper,   fp, float_format);
+  printArray2d("QFRC_GRAVCOMP", m->nv, 1, d->qfrc_gravcomp, fp, float_format);
+  printArray2d("QFRC_FLUID",    m->nv, 1, d->qfrc_fluid,    fp, float_format);
+  printArray2d("QFRC_PASSIVE",  m->nv, 1, d->qfrc_passive,  fp, float_format);
 
-  printArray("EFC_VEL", d->nefc, 1, d->efc_vel, fp, float_format);
-  printArray("EFC_AREF", d->nefc, 1, d->efc_aref, fp, float_format);
+  printArray2d("EFC_VEL", d->nefc, 1, d->efc_vel, fp, float_format);
+  printArray2d("EFC_AREF", d->nefc, 1, d->efc_aref, fp, float_format);
 
-  printArray("SUBTREE_LINVEL", m->nbody, 3, d->subtree_linvel, fp, float_format);
-  printArray("SUBTREE_ANGMOM", m->nbody, 3, d->subtree_angmom, fp, float_format);
+  printArray2d("SUBTREE_LINVEL", m->nbody, 3, d->subtree_linvel, fp, float_format);
+  printArray2d("SUBTREE_ANGMOM", m->nbody, 3, d->subtree_angmom, fp, float_format);
 
-  printArray("ACTUATOR_FORCE", m->nu, 1, d->actuator_force, fp, float_format);
-  printArray("QFRC_ACTUATOR", m->nv, 1, d->qfrc_actuator, fp, float_format);
+  printArray2d("ACTUATOR_FORCE", m->nu, 1, d->actuator_force, fp, float_format);
+  printArray2d("QFRC_ACTUATOR", m->nv, 1, d->qfrc_actuator, fp, float_format);
 
-  printArray("QFRC_SMOOTH", m->nv, 1, d->qfrc_smooth, fp, float_format);
-  printArray("QACC_SMOOTH", m->nv, 1, d->qacc_smooth, fp, float_format);
+  printArray2d("QFRC_SMOOTH", m->nv, 1, d->qfrc_smooth, fp, float_format);
+  printArray2d("QACC_SMOOTH", m->nv, 1, d->qacc_smooth, fp, float_format);
 
-  printArray("EFC_B", d->nefc, 1, d->efc_b, fp, float_format);
-  printArray("EFC_FORCE", d->nefc, 1, d->efc_force, fp, float_format);
-  printArrayInt("EFC_STATE", d->nefc, 1, d->efc_state, fp);
-  printArray("QFRC_CONSTRAINT", m->nv, 1, d->qfrc_constraint, fp, float_format);
+  printArray2d("EFC_B", d->nefc, 1, d->efc_b, fp, float_format);
+  printArray2d("EFC_FORCE", d->nefc, 1, d->efc_force, fp, float_format);
+  printArray2dInt("EFC_STATE", d->nefc, 1, d->efc_state, fp);
+  printArray2d("QFRC_CONSTRAINT", m->nv, 1, d->qfrc_constraint, fp, float_format);
 
-  printArray("QFRC_INVERSE", m->nv, 1, d->qfrc_inverse, fp, float_format);
+  printArray2d("QFRC_INVERSE", m->nv, 1, d->qfrc_inverse, fp, float_format);
 
-  printArray("CACC", m->nbody, 6, d->cacc, fp, float_format);
-  printArray("CFRC_INT", m->nbody, 6, d->cfrc_int, fp, float_format);
-  printArray("CFRC_EXT", m->nbody, 6, d->cfrc_ext, fp, float_format);
+  printArray2d("CACC", m->nbody, 6, d->cacc, fp, float_format);
+  printArray2d("CFRC_INT", m->nbody, 6, d->cfrc_int, fp, float_format);
+  printArray2d("CFRC_EXT", m->nbody, 6, d->cfrc_ext, fp, float_format);
 
   if (d->nisland) {
+    printArray2dInt("TREE_ISLAND", 1, m->ntree, d->tree_island, fp);
+    printArray2dInt("ISLAND_NTREE", 1, d->nisland, d->island_ntree, fp);
+    printArray2dInt("ISLAND_ITREEADR", 1, d->nisland, d->island_itreeadr, fp);
+    printArray2dInt("MAP_ITREE2TREE", 1, m->ntree, d->map_itree2tree, fp);
+
     fprintf(fp, NAME_FORMAT, "DOF_ISLAND");
     for (int i = 0; i < m->nv; i++) {
       fprintf(fp, " %d", d->dof_island[i]);
@@ -1528,4 +1662,156 @@ void mj_printFormattedData(const mjModel* m, const mjData* d, const char* filena
 // print mjData to text file
 void mj_printData(const mjModel* m, const mjData* d, const char* filename) {
   mj_printFormattedData(m, d, filename, FLOAT_FORMAT);
+}
+
+void mj_printScene(const mjvScene* s, const char* filename) {
+  mj_printFormattedScene(s, filename, FLOAT_FORMAT);
+}
+
+void mj_printFormattedScene(const mjvScene* s, const char* filename, const char* float_format) {
+  // get file
+  FILE* fp;
+  if (filename) {
+    fp = fopen(filename, "wt");
+  } else {
+    fp = stdout;
+  }
+
+  // check for nullptr
+  if (!fp) {
+    mju_warning("Could not open file '%s' for writing mjModel", filename);
+    return;
+  }
+
+  // validate format string
+  if (!validateFloatFormat(float_format)) {
+    mju_warning("WARNING: Received invalid float_format. Using default instead.");
+    float_format = FLOAT_FORMAT;
+  }
+
+  fprintf(fp, "GEOMS %d\n", s->ngeom);
+  for (int i = 0; i < s->ngeom; ++i) {
+    const mjvGeom* geom = &s->geoms[i];
+    fprintf(fp,  "  GEOM %d\n", i);
+    printInt(fp, "    type", geom->type);
+    printInt(fp, "    category", geom->category);
+    printStr(fp, "    label", geom->label);
+    printInt(fp, "    objtype", geom->objtype);
+    printInt(fp, "    objid", geom->objid);
+    printArr(fp, "    pos", geom->pos, 3, float_format);
+    printArr(fp, "    mat", geom->mat, 9, float_format);
+    printArr(fp, "    size", geom->size, 3, float_format);
+    printInt(fp, "    segid", geom->segid);
+    printInt(fp, "    dataid", geom->dataid);
+    printInt(fp, "    matid", geom->matid);
+    printInt(fp, "    texcoord", geom->texcoord);
+    printArr(fp, "    rgba", geom->rgba, 4, float_format);
+    printNum(fp, "    emission", geom->emission, float_format);
+    printNum(fp, "    specular", geom->specular, float_format);
+    printNum(fp, "    shininess", geom->shininess, float_format);
+    printNum(fp, "    reflectance", geom->reflectance, float_format);
+    fprintf(fp,  "\n");
+  }
+  fprintf(fp,  "\n");
+
+  fprintf(fp, "LIGHTS %d\n", s->nlight);
+  for (int i = 0; i < s->nlight; ++i) {
+    const mjvLight* light = &s->lights[i];
+    fprintf(fp,  "  LIGHT %d\n", i);
+    printInt(fp, "    id", light->id);
+    printArr(fp, "    pos", light->pos, 3, float_format);
+    printArr(fp, "    dir", light->dir, 3, float_format);
+    printInt(fp, "    type", light->type);
+    printInt(fp, "    castshadow", light->castshadow);
+    printInt(fp, "    headlight", light->headlight);
+    printNum(fp, "    intensity", light->intensity, float_format);
+    printNum(fp, "    range", light->range, float_format);
+    printArr(fp, "    ambient", light->ambient, 3, float_format);
+    printArr(fp, "    diffuse", light->diffuse, 3, float_format);
+    printArr(fp, "    specular", light->specular, 3, float_format);
+    printInt(fp, "    texid", light->texid);
+    printNum(fp, "    exponent", light->exponent, float_format);
+    printArr(fp, "    attenuation", light->attenuation, 3, float_format);
+    printNum(fp, "    cutoff", light->cutoff, float_format);
+    printNum(fp, "    bulbradius", light->bulbradius, float_format);
+    fprintf(fp,  "\n");
+  }
+  fprintf(fp,  "\n");
+
+  fprintf(fp, "CAMERAS %d\n", 2);
+  for (int i = 0; i < 2; ++i) {
+    const mjvGLCamera* camera = &s->camera[i];
+    fprintf(fp,  "  CAMERA %d\n", i);
+    printArr(fp, "    pos", camera->pos, 3, float_format);
+    printArr(fp, "    forward", camera->forward, 3, float_format);
+    printArr(fp, "    up", camera->up, 3, float_format);
+    printInt(fp, "    orthographic", camera->orthographic);
+    printNum(fp, "    frustum_center", camera->frustum_center, float_format);
+    printNum(fp, "    frustum_width", camera->frustum_width, float_format);
+    printNum(fp, "    frustum_bottom", camera->frustum_bottom, float_format);
+    printNum(fp, "    frustum_top", camera->frustum_top, float_format);
+    printNum(fp, "    frustum_near", camera->frustum_near, float_format);
+    printNum(fp, "    frustum_far", camera->frustum_far, float_format);
+    fprintf(fp,  "\n");
+  }
+  fprintf(fp,  "\n");
+
+  fprintf(fp, "FLEX DATA %d\n", s->nflex);
+  for (int i = 0; i < s->nflex; ++i) {
+    fprintf(fp,  "  FLEX DATA %d\n", i);
+    printInt(fp, "    face_used", s->flexfaceused[i]);
+    printInt(fp, "    edge_adr", s->flexedgeadr[i]);
+    printInt(fp, "    edge_num", s->flexedgenum[i]);
+    printInt(fp, "    vert_adr", s->flexvertadr[i]);
+    printInt(fp, "    vert_num", s->flexvertnum[i]);
+    printInt(fp, "    face_adr", s->flexfaceadr[i]);
+    printInt(fp, "    face_num", s->flexfacenum[i]);
+    printStr(fp, "    edges", "...");  // int* flexedge: 2*nflexedge
+    printStr(fp, "    verts", "...");  // float* flexvert: 3*nflexvert
+    printStr(fp, "    faces", "...");  // float* flexface: 9*sum(flexfacenum)
+    printStr(fp, "    normals", "...");  // float* flexnormal: 9*sum(flexfacenum)
+    printStr(fp, "    texcoords", "...");  // float* flextexcoord: 6*sum(flexfacenum)
+    fprintf(fp,  "\n");
+  }
+  fprintf(fp,  "\n");
+
+  fprintf(fp, "SKIN DATA %d\n", s->nskin);
+  for (int i = 0; i < s->nskin; ++i) {
+    fprintf(fp,  "  SKIN DATA %d\n", i);
+    printInt(fp, "    face_num", s->skinfacenum[i]);
+    printInt(fp, "    vert_adr", s->skinvertadr[i]);
+    printInt(fp, "    vert_num", s->skinvertnum[i]);
+    printStr(fp, "    verts", "...");  // float* skinvert: 3*nskinvert
+    printStr(fp, "    normals", "...");  // float* skinnormal: 3*nskinvert
+    fprintf(fp,  "\n");
+  }
+  fprintf(fp,  "\n");
+
+  fprintf(fp, "FLAGS\n");
+  for (int i = 0; i < mjNRNDFLAG; ++i) {
+    fprintf(fp, "  ");
+    fprintf(fp, NAME_FORMAT, mjRNDSTRING[i][0]);
+    fprintf(fp, INT_FORMAT, s->flags[i]);
+    fprintf(fp, "\n");
+  }
+  printInt(fp, "  flexvertopt", s->flexvertopt);
+  printInt(fp, "  flexedgeopt", s->flexedgeopt);
+  printInt(fp, "  flexfaceopt", s->flexfaceopt);
+  printInt(fp, "  flexskinopt", s->flexskinopt);
+  printInt(fp, "  stereo", s->stereo);
+  fprintf(fp,  "\n\n");
+
+  fprintf(fp, "TRANSFORM %d\n", s->enabletransform);
+  if (s->enabletransform) {
+    printArr(fp, "  translate", s->translate, 3, float_format);
+    printArr(fp, "  rotate", s->rotate, 4, float_format);
+    printNum(fp, "  scale", s->scale, float_format);
+    fprintf(fp, "\n");
+  }
+  fprintf(fp, "\n");
+
+  fflush(fp);
+  if (filename) {
+    fclose(fp);
+  }
 }

@@ -24,7 +24,6 @@
 #include "engine/engine_core_constraint.h"
 #include "engine/engine_core_smooth.h"
 #include "engine/engine_derivative.h"
-#include "engine/engine_io.h"
 #include "engine/engine_memory.h"
 #include "engine/engine_macro.h"
 #include "engine/engine_forward.h"
@@ -39,6 +38,9 @@
 void mj_invPosition(const mjModel* m, mjData* d) {
   TM_START1;
   TM_START;
+
+  // clear flag for lazy evaluation
+  d->flg_energypos = 0;
 
   mj_kinematics(m, d);
   mj_comPos(m, d);
@@ -64,12 +66,10 @@ void mj_invPosition(const mjModel* m, mjData* d) {
 }
 
 
-
 // velocity-dependent computations
 void mj_invVelocity(const mjModel* m, mjData* d) {
   mj_fwdVelocity(m, d);
 }
-
 
 
 // convert discrete-time qacc to continuous-time qacc
@@ -153,7 +153,6 @@ static void mj_discreteAcc(const mjModel* m, mjData* d) {
 }
 
 
-
 // inverse constraint solver
 void mj_invConstraint(const mjModel* m, mjData* d) {
   TM_START;
@@ -181,7 +180,6 @@ void mj_invConstraint(const mjModel* m, mjData* d) {
 }
 
 
-
 // inverse dynamics with skip; skipstage is mjtStage
 void mj_inverseSkip(const mjModel* m, mjData* d,
                     int skipstage, int skipsensor) {
@@ -196,7 +194,7 @@ void mj_inverseSkip(const mjModel* m, mjData* d,
     if (!skipsensor) {
       mj_sensorPos(m, d);
     }
-    if (mjENABLED(mjENBL_ENERGY)) {
+    if (mjENABLED(mjENBL_ENERGY) && !d->flg_energypos) {
       mj_energyPos(m, d);
     }
   }
@@ -207,7 +205,7 @@ void mj_inverseSkip(const mjModel* m, mjData* d,
     if (!skipsensor) {
       mj_sensorVel(m, d);
     }
-    if (mjENABLED(mjENBL_ENERGY)) {
+    if (mjENABLED(mjENBL_ENERGY) && !d->flg_energyvel) {
       mj_energyVel(m, d);
     }
   }
@@ -229,6 +227,7 @@ void mj_inverseSkip(const mjModel* m, mjData* d,
   mj_tendonBias(m, d, d->qfrc_inverse);
 
   if (!skipsensor) {
+    d->flg_rnepost = 0;  // clear flag for lazy evaluation
     mj_sensorAcc(m, d);
   }
 
@@ -251,12 +250,10 @@ void mj_inverseSkip(const mjModel* m, mjData* d,
 }
 
 
-
 // inverse dynamics
 void mj_inverse(const mjModel* m, mjData* d) {
   mj_inverseSkip(m, d, mjSTAGE_NONE, 0);
 }
-
 
 
 // compare forward and inverse dynamics, without changing results of forward

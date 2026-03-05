@@ -25,7 +25,7 @@ from jax import numpy as jp
 from mujoco.mjx.warp import types as mjx_warp_types
 import numpy as np
 import warp as wp
-from mujoco.mjx.third_party.warp.jax_experimental import ffi
+from mujoco.mjx.third_party.warp._src.jax_experimental import ffi
 
 
 def flatten_signature(signature: inspect.Signature, args: Tuple[Any, ...]):
@@ -101,18 +101,30 @@ def jax_callable_variadic_tuple(
     vmap_method: Optional[str] = None,
     output_dims: Optional[dict[str, tuple[int, ...]]] = None,
     in_out_argnames: Optional[Sequence[str]] = None,
+    stage_in_argnames: Optional[Sequence[str]] = None,
+    stage_out_argnames: Optional[Sequence[str]] = None,
 ):
   """Wraps a JAX callable to support variadic tuples and dataclasses."""
 
   def callable_wrapper(*args, **kwargs):
     def func_wrapper(*flat_args, **kwargs):
-      unflat_args = jax.tree.unflatten(in_tree, flat_args)
-      return func(*unflat_args, **kwargs)
+      num_inputs = in_tree.num_leaves
+      flat_inputs = flat_args[:num_inputs]
+      output_buffers = flat_args[num_inputs:]
+      unflat_args = jax.tree.unflatten(in_tree, flat_inputs)
+      return func(*unflat_args, *output_buffers, **kwargs)
 
     # Provide a flattened signature for the Warp callable machinery.
-    func_wrapper.__signature__ = flatten_signature(
-        inspect.signature(func), args
-    )
+    new_signature = flatten_signature(inspect.signature(func), args)
+    func_wrapper.__signature__ = new_signature
+    func_wrapper.__annotations__ = {
+        p.name: p.annotation
+        for p in new_signature.parameters.values()
+        if p.annotation is not inspect.Parameter.empty
+    }
+    if new_signature.return_annotation is not inspect.Signature.empty:
+      func_wrapper.__annotations__['return'] = new_signature.return_annotation
+
     my_callable = ffi.jax_callable(
         func_wrapper,
         num_outputs=num_outputs,
@@ -120,6 +132,8 @@ def jax_callable_variadic_tuple(
         vmap_method=vmap_method,
         output_dims=output_dims,
         in_out_argnames=in_out_argnames,
+        stage_in_argnames=stage_in_argnames,
+        stage_out_argnames=stage_out_argnames,
     )
 
     flat_args, in_tree = jax.tree.flatten(args)
@@ -140,7 +154,7 @@ def _format_arg(arg: Any, name: str, annotation: Any, verbose: bool):
         for i in range(len(arg))
     )
 
-  if not isinstance(annotation, wp.types.array):
+  if not isinstance(annotation, wp.array):
     if verbose:
       print(f'Skipping {name}: {arg}')
     return arg
@@ -183,11 +197,8 @@ def format_args_for_warp(func, verbose=False):
   return wrapper
 
 
-def _get_mapping_from_tree_path(
-    path: jax.tree_util.KeyPath,
-    mapping: dict[str, int],
-) -> Optional[int]:
-  """Gets the mapped value from a tree path."""
+def _tree_path_to_attr_str(path: jax.tree_util.KeyPath) -> str:
+  """Converts a tree path to a dataclass attribute string."""
   if not isinstance(path, tuple):
     raise NotImplementedError(
         f'Parsing for jax tree path {path} not implemented.'
@@ -200,8 +211,15 @@ def _get_mapping_from_tree_path(
 
   assert all(isinstance(p, jax.tree_util.GetAttrKey) for p in path)
   path = [p for p in path if p.name != '_impl']
-  attr = '__'.join(p.name for p in path)
+  return '__'.join(p.name for p in path)
 
+
+def _get_mapping_from_tree_path(
+    path: jax.tree_util.KeyPath,
+    mapping: dict[str, int],
+) -> Optional[int]:
+  """Gets the mapped value from a tree path."""
+  attr = _tree_path_to_attr_str(path)
   # None if the MJX public field is not present in the MJX-Warp mapping.
   return mapping.get(attr)
 
@@ -234,7 +252,7 @@ def _squeeze_dim(leaf_expanded: Any, leaf: Any) -> Any:
   return leaf_expanded
 
 
-def marshal_jax_warp_callable(func):
+def marshal_jax_warp_callable(func, raw_output: bool = False):
   """Marshal fields into a MuJoCo Warp function."""
 
   @functools.wraps(func)
@@ -254,6 +272,9 @@ def marshal_jax_warp_callable(func):
         d,
     )
     d_expanded_result = func(m_expanded, d_expanded)
+
+    if raw_output:
+      return d_expanded_result
     d_result = jax.tree.map(_squeeze_dim, d_expanded_result, d)
     return d_result
 
@@ -302,7 +323,44 @@ def _maybe_broadcast_to(
   return leaf
 
 
-def marshal_custom_vmap(vmap_func):
+def _check_leading_dim(
+    path: jax.tree_util.KeyPath,
+    leaf: Any,
+    expected_batch_dim: int,
+    expected_nconmax: int,
+    expected_njmax: int,
+):
+  """Asserts that the batch dimension of a leaf node matches the expected batch dimension."""
+  has_batch_dim = _get_mapping_from_tree_path(
+      path, mjx_warp_types._BATCH_DIM['Data']
+  )
+  attr = _tree_path_to_attr_str(path)
+  if has_batch_dim and leaf.shape[0] != expected_batch_dim:
+    raise ValueError(
+        f'Leaf node batch size ({leaf.shape[0]}) and expected batch size'
+        f' ({expected_batch_dim}) do not match for field {attr}.'
+    )
+  if (
+      not has_batch_dim
+      and attr.startswith('contact__')
+      and leaf.shape[0] != expected_nconmax
+  ):
+    raise ValueError(
+        f'Leaf node leading dim ({leaf.shape[0]}) does not match nconmax'
+        f' ({expected_nconmax}) for field {attr}.'
+    )
+  if (
+      not has_batch_dim
+      and attr.startswith('efc__')
+      and leaf.shape[0] != expected_njmax
+  ):
+    raise ValueError(
+        f'Leaf node leading dim ({leaf.shape[0]}) does not match njmax'
+        f' ({expected_njmax}) for field {attr}.'
+    )
+
+
+def marshal_custom_vmap(vmap_func, raw_output: bool = False):
   """Marshal fields for a custom vmap into an MuJoCo Warp function."""
 
   @functools.wraps(vmap_func)
@@ -315,6 +373,13 @@ def marshal_custom_vmap(vmap_func):
             path, x, is_b, axis_size, 'Data'
         ),
         d, is_batched[1],  # fmt: skip
+    )
+    # Check leading dimensions.
+    jax.tree.map_with_path(
+        lambda path, x: _check_leading_dim(
+            path, x, d_broadcast.qpos.shape[0], d._impl.naconmax, d._impl.njmax  # pylint: disable=protected-access
+        ),
+        d_broadcast,
     )
     # Flatten batch dims into the first axis if the vmap was nested.
     m_flat = jax.tree.map_with_path(
@@ -332,6 +397,9 @@ def marshal_custom_vmap(vmap_func):
     d_broadcast_flat_result, out_batched = vmap_func(
         axis_size, is_batched, m_flat, d_broadcast_flat
     )
+    if raw_output:
+      return d_broadcast_flat_result, out_batched
+
     # Explicitly mark MuJoCo Warp data fields as batched after vmapping is done.
     out_batched = jax.tree.map_with_path(
         # NB: if a field is not in MuJoCo Warp, we let JAX do its magic.
